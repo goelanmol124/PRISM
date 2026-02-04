@@ -1,0 +1,8 @@
+langgraph
+langchain
+langchain-openai
+openai-whisper
+moviepy
+python-dotenv
+torch
+numpy<2.0
