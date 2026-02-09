@@ -1,2 +1,13 @@
 /venv/
+.venv/
 .env
+__pycache__/
+*.pyc
+
+# Dev mode cache
+.dev_cache/
+
+# Output files
+*.mp4
+*.mp3
+execution_logs.jsonl

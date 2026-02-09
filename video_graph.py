@@ -1,6 +1,7 @@
 import os
 import json
 import warnings
+import hashlib
 from typing import TypedDict, List, Any, Dict
 import datetime
 import uuid
@@ -24,6 +25,9 @@ load_dotenv()
 # Check for API Key
 if not os.getenv("OPENROUTER_API_KEY"):
     raise ValueError("OPENROUTER_API_KEY not found in .env file")
+
+# Dev mode cache directory
+CACHE_DIR = ".dev_cache"
 
 # --- Logging Setup ---
 class StructuredLogger:
@@ -54,6 +58,17 @@ class VideoState(TypedDict):
     cuts: List[dict] # {start: float, end: float, reason: str}
     heading: str
     output_video_path: str
+    dev_mode: bool  # Development mode: cache transcriptions
+
+# --- Helper Functions ---
+
+def get_video_hash(video_path: str) -> str:
+    """Calculate MD5 hash of video file for cache identification."""
+    hash_md5 = hashlib.md5()
+    with open(video_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()[:16]
 
 # --- Nodes ---
 
@@ -79,16 +94,32 @@ def extract_audio(state: VideoState):
         return {"audio_path": None} 
 
 def transcribe_audio(state: VideoState):
-    """Transcribes audio using local Whisper model."""
+    """Transcribes audio using local Whisper model. Uses cache in dev mode."""
     print("--- Transcribing Audio ---")
-    logger.log_event("node_start", {"node": "transcribe_audio", "input": {"audio_path": state["audio_path"]}})
+    logger.log_event("node_start", {"node": "transcribe_audio", "input": {"audio_path": state["audio_path"], "dev_mode": state.get("dev_mode", False)}})
     
     audio_path = state["audio_path"]
+    dev_mode = state.get("dev_mode", False)
+    video_path = state["input_video_path"]
     
     if not audio_path or not os.path.exists(audio_path):
         error_msg = "Audio file not found or extraction failed."
         logger.log_event("node_error", {"node": "transcribe_audio", "error": error_msg})
         raise FileNotFoundError(error_msg)
+
+    # Dev mode: check cache first
+    if dev_mode:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        video_hash = get_video_hash(video_path)
+        cache_file = os.path.join(CACHE_DIR, f"{video_hash}_transcript.json")
+        
+        if os.path.exists(cache_file):
+            print(f"[DEV] Loading cached transcript: {cache_file}")
+            logger.log_event("cache_hit", {"node": "transcribe_audio", "cache_file": cache_file})
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": cached["transcript_text"][:100], "segment_count": len(cached["transcript_segments"]), "from_cache": True}})
+            return cached
 
     # Check for GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,6 +133,16 @@ def transcribe_audio(state: VideoState):
             "transcript_text": result["text"],
             "transcript_segments": result["segments"]
         }
+        
+        # Dev mode: save to cache
+        if dev_mode:
+            video_hash = get_video_hash(video_path)
+            cache_file = os.path.join(CACHE_DIR, f"{video_hash}_transcript.json")
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(output, f, ensure_ascii=False)
+            print(f"[DEV] Cached transcript: {cache_file}")
+            logger.log_event("cache_save", {"node": "transcribe_audio", "cache_file": cache_file})
+        
         logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": result["text"][:100], "segment_count": len(result["segments"])}})
         return output
     except Exception as e:
@@ -128,17 +169,26 @@ def analyze_transcript(state: VideoState):
     segment_details = "\n".join([f"[{s['start']:.2f}-{s['end']:.2f}]: {s['text']}" for s in segments])
     
     system_prompt = """
-    You are an expert video editor creating viral shorts for Gen Z.
-    Your goal is to select the most engaging, funny, or insightful segments from the transcript to create a fast-paced 30-60 second video.
-    
-    For each cut, decide the best transition TO the NEXT clip:
-    - "cut": Fast-paced, standard dialogue. Use this for 80% of transitions.
-    - "crossfade": Smooth flow between related topics.
-    - "fade_to_black": Dramatic pause or scene change.
-    
-    The "transition" field specifies how this clip should transition into the NEXT clip in the sequence.
-    Merge adjacent segments if they flow together.
-    """
+You are an expert video editor creating viral shorts for Gen Z.
+Select the most engaging segments from the transcript to create a 30-60 second video.
+
+For each cut, specify transition type to the NEXT clip:
+- "cut": Fast-paced (use for 80% of transitions)
+- "crossfade": Smooth flow between topics
+- "fade_to_black": Dramatic pause
+
+CRITICAL: You MUST respond with ONLY valid JSON matching this EXACT schema:
+{
+  "cuts": [
+    {"start": 10.5, "end": 15.2, "reason": "Hook intro", "transition": "cut"},
+    {"start": 45.0, "end": 50.1, "reason": "Key moment", "transition": "crossfade"}
+  ],
+  "order": [0, 1]
+}
+
+IMPORTANT: Use "start" and "end" as field names, NOT "start_time" or "end_time".
+Merge adjacent segments if they flow together. Keep 3-7 cuts total.
+"""
     
     user_message = f"Here is the video transcript:\n{segment_details}"
     
@@ -188,17 +238,22 @@ def generate_heading(state: VideoState):
     )
     
     system_prompt = """
-    You are a viral content strategist for Gen Z on Instagram Reels and TikTok, specifically for the Indian market.
-    Your goal is to create a SINGLE, short, punchy, and witty heading for a video about Economics/Finance.
-    
-    The heading should be:
-    - Catchy and hook the viewer instantly.
-    - Relevant to the content but with a fun, modern twist.
-    - Use Gen Z slang or internet culture references where appropriate (but keep it understandable).
-    - MAX 5-7 words.
-    - NO hashtags.
-    - "POV:", "Me when:", or question formats work well.
-    """
+You are a viral content strategist for Gen Z on Instagram Reels and TikTok.
+Create a SINGLE, short, punchy heading for the video.
+
+Rules:
+- Catchy and hook instantly
+- MAX 5-7 words
+- NO hashtags
+- "POV:", "Me when:", or question formats work well
+
+CRITICAL: Respond with ONLY valid JSON in this EXACT format:
+{"heading": "Your catchy heading here"}
+
+Examples:
+{"heading": "POV: You just learned taxes exist"}
+{"heading": "Why your wallet is crying rn"}
+"""
     
     user_message = f"Here is the video transcript:\n{transcript_text[:2000]}..." # Truncate for efficiency if needed
     
@@ -292,12 +347,16 @@ def edit_video(state: VideoState):
             heading = state.get("heading")
             if heading:
                 try:
-                    # Create a TextClip - requires ImageMagick for some methods
+                    # Use standard Windows font path for reliability
+                    font_path = "C:/Windows/Fonts/arialbd.ttf"  # Arial Bold
+                    if not os.path.exists(font_path):
+                        font_path = "C:/Windows/Fonts/arial.ttf"  # Fallback to regular Arial
+                    
                     txt_clip = TextClip(
                         text=heading, 
                         font_size=70, 
                         color='white', 
-                        font='Arial-Bold',
+                        font=font_path,
                         stroke_color='black', 
                         stroke_width=2,
                         size=(int(final_clip.w * 0.8), None)
@@ -307,7 +366,8 @@ def edit_video(state: VideoState):
                     final_clip = CompositeVideoClip([final_clip, txt_clip])
                     print(f"Added heading overlay: {heading}")
                 except Exception as e:
-                    print(f"Could not add heading overlay (ImageMagick issue?): {e}")
+                    print(f"Could not add heading overlay: {e}")
+                    logger.log_event("warning", {"node": "edit_video", "warning": f"Heading overlay failed: {e}", "heading": heading})
 
             final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
             final_clip.close()
@@ -347,24 +407,26 @@ if __name__ == "__main__":
     import argparse
     import sys
     
-    # Simple CLI
-    if len(sys.argv) < 2:
-        print("Usage: python video_graph.py <video_path>")
-        sys.exit(1)
-        
-    video_path = sys.argv[1]
+    parser = argparse.ArgumentParser(description="PRISM Video Graph - Viral shorts generator")
+    parser.add_argument("video_path", help="Path to the input video file")
+    parser.add_argument("--dev", action="store_true", help="Development mode: cache transcriptions for faster iteration")
     
-    if not os.path.exists(video_path):
-        print(f"Error: Video file '{video_path}' not found.")
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.video_path):
+        print(f"Error: Video file '{args.video_path}' not found.")
         sys.exit(1)
 
-    print(f"Processing video: {video_path}")
-    initial_state = {"input_video_path": video_path}
+    if args.dev:
+        print("[DEV MODE] Transcription caching enabled")
+    
+    print(f"Processing video: {args.video_path}")
+    initial_state = {"input_video_path": args.video_path, "dev_mode": args.dev}
     
     try:
         final_state = app.invoke(initial_state)
         print(f"Video processing complete! Output saved to: {final_state['output_video_path']}")
-        logger.log_event("run_complete", {"output_video_path": final_state['output_video_path']})
+        logger.log_event("run_complete", {"output_video_path": final_state['output_video_path'], "dev_mode": args.dev})
     except Exception as e:
         print(f"An error occurred during execution: {e}")
         logger.log_event("run_failed", {"error": str(e)})
@@ -373,3 +435,4 @@ if __name__ == "__main__":
         if os.path.exists("temp_audio.mp3"):
             os.remove("temp_audio.mp3")
             print("Cleaned up temp_audio.mp3")
+
