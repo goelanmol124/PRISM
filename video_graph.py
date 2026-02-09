@@ -281,7 +281,7 @@ Examples:
         return {"heading": "Economics 101"} # Fallback
 
 def edit_video(state: VideoState):
-    """Cuts and stitches the video based on analysis, with smart transitions."""
+    """Cuts and stitches the video based on analysis, with smart transitions, subtitles, and letterbox heading."""
     print("--- Editing Video ---")
     logger.log_event("node_start", {"node": "edit_video", "input": {"cuts_count": len(state["cuts"]), "heading": state.get("heading")}})
     
@@ -289,15 +289,20 @@ def edit_video(state: VideoState):
     cuts = state["cuts"]
     output_path = "output.mp4"
     
-    # MoviePy v2.x imports for effects
+    # MoviePy imports
     from moviepy.video import fx as vfx
-    from moviepy import TextClip, CompositeVideoClip
+    from moviepy import TextClip, CompositeVideoClip, VideoFileClip
 
     try:
         original_clip = VideoFileClip(video_path)
         clips = []
         
-        # 1. First Pass: Create all subclips
+        # Robust font path selection for Windows
+        font_path = "C:/Windows/Fonts/arialbd.ttf"
+        if not os.path.exists(font_path):
+            font_path = "C:/Windows/Fonts/arial.ttf"
+
+        # 1. First Pass: Create all subclips and overlay subtitles
         for cut in cuts:
             start = cut["start"]
             end = cut["end"]
@@ -306,70 +311,107 @@ def edit_video(state: VideoState):
             
             if end > start:
                 clip = original_clip.subclipped(start, end)
+                
+                # --- Subtitle Overlay Logic ---
+                subtitle_clips = []
+                for seg in state["transcript_segments"]:
+                    # Intersection logic
+                    seg_start = seg["start"]
+                    seg_end = seg["end"]
+                    
+                    overlap_start = max(start, seg_start)
+                    overlap_end = min(end, seg_end)
+                    
+                    if overlap_end > overlap_start:
+                        text = seg["text"].strip()
+                        if not text:
+                            continue
+                            
+                        # Relative timing
+                        sub_start_rel = max(0, seg_start - start)
+                        sub_end_rel = min(clip.duration, seg_end - start)
+                        duration_seg = sub_end_rel - sub_start_rel
+                        
+                        if duration_seg > 0.3: 
+                            try:
+                                txt_clip = TextClip(
+                                    text=text,
+                                    font_size=40,
+                                    color='yellow',
+                                    font=font_path,
+                                    stroke_color='black',
+                                    stroke_width=2,
+                                    method='caption',
+                                    size=(int(clip.w * 0.8), None),
+                                    text_align='center'
+                                )
+                                txt_clip = txt_clip.with_position(('center', 'center')).with_start(sub_start_rel).with_duration(duration_seg)
+                                subtitle_clips.append(txt_clip)
+                            except Exception as e:
+                                print(f"Subtitle error: {e}")
+                
+                if subtitle_clips:
+                    clip = CompositeVideoClip([clip] + subtitle_clips)
+                
                 clips.append(clip)
         
         if clips:
             final_clips_with_effects = []
             
-            # Iterate to apply transitions
+            # 2. Apply Transitions
             for i in range(len(clips)):
                 current_clip = clips[i]
-                
-                # Default to 'cut' if processing last clip or error
                 transition_type = cuts[i].get("transition", "cut") if i < len(cuts) else "cut"
                 
-                # Check if next clip exists
                 if i < len(clips) - 1:
                     next_clip = clips[i+1]
                     
-                    # Logic for transitions
                     if transition_type == "crossfade":
                         min_dur = min(current_clip.duration, next_clip.duration)
                         duration = min(1.0, min_dur / 2.0)
-                        
-                        # Apply fade effects for crossfade simulation
                         current_clip = current_clip.with_effects([vfx.FadeOut(duration)])
                         clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
-                        
                     elif transition_type == "fade_to_black":
                         duration = 0.5
-                        # Fade out current clip, fade in next clip
                         current_clip = current_clip.with_effects([vfx.FadeOut(duration)])
                         clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
                 
                 final_clips_with_effects.append(current_clip)
             
             print(f"Concatenating {len(final_clips_with_effects)} clips")
-
             final_clip = concatenate_videoclips(final_clips_with_effects, method="compose")
             
-            # 4. Overlay Heading
+            # 3. Add Letterboxing (Black Bars)
+            bar_height = int(final_clip.h * 0.15) 
+            final_clip_padded = final_clip.with_effects([
+                vfx.Margin(top=bar_height, bottom=bar_height, color=(0, 0, 0))
+            ])
+            
+            # 4. Overlay Heading in Top Bar
             heading = state.get("heading")
             if heading:
                 try:
-                    # Use standard Windows font path for reliability
-                    font_path = "C:/Windows/Fonts/arialbd.ttf"  # Arial Bold
-                    if not os.path.exists(font_path):
-                        font_path = "C:/Windows/Fonts/arial.ttf"  # Fallback to regular Arial
-                    
-                    txt_clip = TextClip(
+                    target_width = int(final_clip_padded.w * 0.9)
+                    heading_clip = TextClip(
                         text=heading, 
-                        font_size=70, 
+                        font_size=60, 
                         color='white', 
                         font=font_path,
                         stroke_color='black', 
                         stroke_width=2,
-                        size=(int(final_clip.w * 0.8), None)
+                        method='caption', 
+                        size=(target_width, bar_height),
+                        text_align='center' 
                     )
-                    txt_clip = txt_clip.with_position(('center', 100)).with_duration(final_clip.duration)
-                    
-                    final_clip = CompositeVideoClip([final_clip, txt_clip])
+                    heading_clip = heading_clip.with_position(('center', 0)).with_duration(final_clip_padded.duration)
+                    final_clip_padded = CompositeVideoClip([final_clip_padded, heading_clip])
                     print(f"Added heading overlay: {heading}")
                 except Exception as e:
                     print(f"Could not add heading overlay: {e}")
                     logger.log_event("warning", {"node": "edit_video", "warning": f"Heading overlay failed: {e}", "heading": heading})
 
-            final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+            final_clip_padded.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+            final_clip_padded.close()
             final_clip.close()
 
         original_clip.close()
@@ -435,4 +477,3 @@ if __name__ == "__main__":
         if os.path.exists("temp_audio.mp3"):
             os.remove("temp_audio.mp3")
             print("Cleaned up temp_audio.mp3")
-
