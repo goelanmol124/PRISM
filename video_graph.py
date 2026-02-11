@@ -1,4 +1,6 @@
 import os
+import sys
+import platform
 import json
 import warnings
 import hashlib
@@ -10,7 +12,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
 import whisper
 import torch
 from llm_core import call_llm_with_structure, AnalysisResult, HeadingResult
@@ -28,6 +30,11 @@ if not os.getenv("OPENROUTER_API_KEY"):
 
 # Dev mode cache directory
 CACHE_DIR = ".dev_cache"
+
+# --- Output Constants ---
+TARGET_WIDTH = 1080
+TARGET_HEIGHT = 1920
+TARGET_ASPECT = TARGET_WIDTH / TARGET_HEIGHT  # 9:16 = 0.5625
 
 # --- Logging Setup ---
 class StructuredLogger:
@@ -94,12 +101,11 @@ def extract_audio(state: VideoState):
         return {"audio_path": None} 
 
 def transcribe_audio(state: VideoState):
-    """Transcribes audio using local Whisper model. Uses cache in dev mode."""
+    """Transcribes audio using local Whisper model. Always caches transcripts by filename."""
     print("--- Transcribing Audio ---")
-    logger.log_event("node_start", {"node": "transcribe_audio", "input": {"audio_path": state["audio_path"], "dev_mode": state.get("dev_mode", False)}})
+    logger.log_event("node_start", {"node": "transcribe_audio", "input": {"audio_path": state["audio_path"]}})
     
     audio_path = state["audio_path"]
-    dev_mode = state.get("dev_mode", False)
     video_path = state["input_video_path"]
     
     if not audio_path or not os.path.exists(audio_path):
@@ -107,19 +113,18 @@ def transcribe_audio(state: VideoState):
         logger.log_event("node_error", {"node": "transcribe_audio", "error": error_msg})
         raise FileNotFoundError(error_msg)
 
-    # Dev mode: check cache first
-    if dev_mode:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        video_hash = get_video_hash(video_path)
-        cache_file = os.path.join(CACHE_DIR, f"{video_hash}_transcript.json")
-        
-        if os.path.exists(cache_file):
-            print(f"[DEV] Loading cached transcript: {cache_file}")
-            logger.log_event("cache_hit", {"node": "transcribe_audio", "cache_file": cache_file})
-            with open(cache_file, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": cached["transcript_text"][:100], "segment_count": len(cached["transcript_segments"]), "from_cache": True}})
-            return cached
+    # Always-on cache: keyed by video filename (assumed unique)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+    cache_file = os.path.join(CACHE_DIR, f"{video_basename}_transcript.json")
+    
+    if os.path.exists(cache_file):
+        print(f"[CACHE] Loading cached transcript: {cache_file}")
+        logger.log_event("cache_hit", {"node": "transcribe_audio", "cache_file": cache_file})
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": cached["transcript_text"][:100], "segment_count": len(cached["transcript_segments"]), "from_cache": True}})
+        return cached
 
     # Check for GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -134,14 +139,11 @@ def transcribe_audio(state: VideoState):
             "transcript_segments": result["segments"]
         }
         
-        # Dev mode: save to cache
-        if dev_mode:
-            video_hash = get_video_hash(video_path)
-            cache_file = os.path.join(CACHE_DIR, f"{video_hash}_transcript.json")
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(output, f, ensure_ascii=False)
-            print(f"[DEV] Cached transcript: {cache_file}")
-            logger.log_event("cache_save", {"node": "transcribe_audio", "cache_file": cache_file})
+        # Always save to cache
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False)
+        print(f"[CACHE] Saved transcript: {cache_file}")
+        logger.log_event("cache_save", {"node": "transcribe_audio", "cache_file": cache_file})
         
         logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": result["text"][:100], "segment_count": len(result["segments"])}})
         return output
@@ -234,25 +236,28 @@ def generate_heading(state: VideoState):
     llm = ModelFactory.get_model(
         provider=os.getenv("LLM_PROVIDER", "openrouter"),
         model_name=os.getenv("LLM_MODEL", "z-ai/glm-4.5-air:free"),
-        temperature=0.8
+        temperature=0.9
     )
     
     system_prompt = """
-You are a viral content strategist for Gen Z on Instagram Reels and TikTok.
-Create a SINGLE, short, punchy heading for the video.
+You are a video editor creating context overlays for short-form content on TikTok and Instagram Reels.
+Your job is to write a SINGLE, concise heading that gives the viewer BACKGROUND CONTEXT about what is happening in the video.
 
 Rules:
-- Catchy and hook instantly
-- MAX 5-7 words
-- NO hashtags
-- "POV:", "Me when:", or question formats work well
+- Provide factual context: WHO is speaking, WHERE, and WHAT the situation is about
+- MAX 8-12 words
+- NO hashtags, NO emojis
+- Should read like a news caption or scene description
+- Do NOT use meme formats like "POV:", "Me when:", "Nobody:" etc.
+- Be specific, not generic
 
 CRITICAL: Respond with ONLY valid JSON in this EXACT format:
-{"heading": "Your catchy heading here"}
+{"heading": "Your contextual heading here"}
 
 Examples:
-{"heading": "POV: You just learned taxes exist"}
-{"heading": "Why your wallet is crying rn"}
+{"heading": "Student testifies before Congress on rising tuition costs"}
+{"heading": "CEO explains why layoffs were necessary at town hall"}
+{"heading": "Doctor breaks down the real risk behind viral health trend"}
 """
     
     user_message = f"Here is the video transcript:\n{transcript_text[:2000]}..." # Truncate for efficiency if needed
@@ -280,8 +285,56 @@ Examples:
         logger.log_event("node_error", {"node": "generate_heading", "error": str(e)})
         return {"heading": "Economics 101"} # Fallback
 
+def _resolve_font():
+    """Cross-platform font resolution with fallback to None (ImageMagick default)."""
+    font_candidates = [
+        # Windows
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        # Linux — Debian/Ubuntu
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        # Linux — Fedora/RHEL
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for candidate in font_candidates:
+        if os.path.exists(candidate):
+            return candidate
+    print("Warning: No system font found, using default ImageMagick font.")
+    return None
+
+
+def _crop_to_vertical(clip):
+    """Center-crop a clip to 9:16 aspect ratio and resize to TARGET_WIDTH x TARGET_HEIGHT."""
+    src_w, src_h = clip.w, clip.h
+    src_aspect = src_w / src_h
+
+    if src_aspect > TARGET_ASPECT:
+        # Source is wider than 9:16 — crop width (take center vertical strip)
+        new_w = int(src_h * TARGET_ASPECT)
+        x_offset = (src_w - new_w) // 2
+        clip = clip.cropped(x1=x_offset, y1=0, x2=x_offset + new_w, y2=src_h)
+    elif src_aspect < TARGET_ASPECT:
+        # Source is taller than 9:16 — crop height
+        new_h = int(src_w / TARGET_ASPECT)
+        y_offset = (src_h - new_h) // 2
+        clip = clip.cropped(x1=0, y1=y_offset, x2=src_w, y2=y_offset + new_h)
+
+    # Resize to exact target resolution
+    clip = clip.resized((TARGET_WIDTH, TARGET_HEIGHT))
+    return clip
+
+
 def edit_video(state: VideoState):
-    """Cuts and stitches the video based on analysis, with smart transitions, subtitles, and letterbox heading."""
+    """Cuts and stitches the video with 9:16 vertical format, subtitles, transitions, and context heading."""
     print("--- Editing Video ---")
     logger.log_event("node_start", {"node": "edit_video", "input": {"cuts_count": len(state["cuts"]), "heading": state.get("heading")}})
     
@@ -292,15 +345,19 @@ def edit_video(state: VideoState):
     # MoviePy imports
     from moviepy.video import fx as vfx
     from moviepy import TextClip, CompositeVideoClip, VideoFileClip
+    import numpy as np
 
     try:
         original_clip = VideoFileClip(video_path)
         clips = []
         
-        # Robust font path selection for Windows
-        font_path = "C:/Windows/Fonts/arialbd.ttf"
-        if not os.path.exists(font_path):
-            font_path = "C:/Windows/Fonts/arial.ttf"
+        font_path = _resolve_font()
+
+        # --- Font sizes proportional to target output width ---
+        subtitle_font_size = max(16, int(TARGET_WIDTH * 0.035))   # ~38px on 1080w
+        heading_font_size = max(18, int(TARGET_WIDTH * 0.04))     # ~43px on 1080w
+        subtitle_stroke = max(1, int(TARGET_WIDTH * 0.002))       # ~2px
+        heading_stroke = max(1, int(TARGET_WIDTH * 0.0025))       # ~3px
 
         # 1. First Pass: Create all subclips and overlay subtitles
         for cut in cuts:
@@ -312,10 +369,12 @@ def edit_video(state: VideoState):
             if end > start:
                 clip = original_clip.subclipped(start, end)
                 
+                # Crop each clip to 9:16 vertical
+                clip = _crop_to_vertical(clip)
+                
                 # --- Subtitle Overlay Logic ---
                 subtitle_clips = []
                 for seg in state["transcript_segments"]:
-                    # Intersection logic
                     seg_start = seg["start"]
                     seg_end = seg["end"]
                     
@@ -327,7 +386,6 @@ def edit_video(state: VideoState):
                         if not text:
                             continue
                             
-                        # Relative timing
                         sub_start_rel = max(0, seg_start - start)
                         sub_end_rel = min(clip.duration, seg_end - start)
                         duration_seg = sub_end_rel - sub_start_rel
@@ -336,22 +394,24 @@ def edit_video(state: VideoState):
                             try:
                                 txt_clip = TextClip(
                                     text=text,
-                                    font_size=40,
-                                    color='yellow',
+                                    font_size=subtitle_font_size,
+                                    color='white',
                                     font=font_path,
                                     stroke_color='black',
-                                    stroke_width=2,
+                                    stroke_width=subtitle_stroke,
                                     method='caption',
-                                    size=(int(clip.w * 0.8), None),
+                                    size=(int(clip.w * 0.85), None),
                                     text_align='center'
                                 )
-                                txt_clip = txt_clip.with_position(('center', 'center')).with_start(sub_start_rel).with_duration(duration_seg)
+                                # Position at bottom 12% of frame
+                                sub_y = int(clip.h * 0.82)
+                                txt_clip = txt_clip.with_position(('center', sub_y)).with_start(sub_start_rel).with_duration(duration_seg)
                                 subtitle_clips.append(txt_clip)
                             except Exception as e:
                                 print(f"Subtitle error: {e}")
                 
                 if subtitle_clips:
-                    clip = CompositeVideoClip([clip] + subtitle_clips)
+                    clip = CompositeVideoClip([clip] + subtitle_clips, size=(TARGET_WIDTH, TARGET_HEIGHT))
                 
                 clips.append(clip)
         
@@ -381,37 +441,49 @@ def edit_video(state: VideoState):
             print(f"Concatenating {len(final_clips_with_effects)} clips")
             final_clip = concatenate_videoclips(final_clips_with_effects, method="compose")
             
-            # 3. Add Letterboxing (Black Bars)
-            bar_height = int(final_clip.h * 0.15) 
-            final_clip_padded = final_clip.with_effects([
-                vfx.Margin(top=bar_height, bottom=bar_height, color=(0, 0, 0))
-            ])
+            # 3. Semi-transparent top bar for heading (8% of height)
+            bar_height = int(TARGET_HEIGHT * 0.08)  # ~154px on 1920h
             
-            # 4. Overlay Heading in Top Bar
             heading = state.get("heading")
             if heading:
                 try:
-                    target_width = int(final_clip_padded.w * 0.9)
+                    # Create a semi-transparent dark gradient bar
+                    def make_gradient_frame(t):
+                        """Creates a top-to-bottom dark gradient bar with alpha."""
+                        frame = np.zeros((bar_height, TARGET_WIDTH, 3), dtype=np.uint8)
+                        for row in range(bar_height):
+                            # Gradient from opacity ~0.85 at top to ~0.3 at bottom
+                            alpha = 0.85 - (0.55 * row / bar_height)
+                            frame[row, :] = int(alpha * 255 * 0.15)  # Dark tint
+                        return frame
+                    
+                    gradient_bar = ColorClip(size=(TARGET_WIDTH, bar_height), color=(0, 0, 0))
+                    gradient_bar = gradient_bar.with_opacity(0.65).with_duration(final_clip.duration)
+                    gradient_bar = gradient_bar.with_position((0, 0))
+                    
                     heading_clip = TextClip(
                         text=heading, 
-                        font_size=60, 
+                        font_size=heading_font_size, 
                         color='white', 
                         font=font_path,
                         stroke_color='black', 
-                        stroke_width=2,
+                        stroke_width=heading_stroke,
                         method='caption', 
-                        size=(target_width, bar_height),
+                        size=(int(TARGET_WIDTH * 0.9), bar_height),
                         text_align='center' 
                     )
-                    heading_clip = heading_clip.with_position(('center', 0)).with_duration(final_clip_padded.duration)
-                    final_clip_padded = CompositeVideoClip([final_clip_padded, heading_clip])
+                    heading_clip = heading_clip.with_position(('center', 0)).with_duration(final_clip.duration)
+                    
+                    final_clip = CompositeVideoClip(
+                        [final_clip, gradient_bar, heading_clip],
+                        size=(TARGET_WIDTH, TARGET_HEIGHT)
+                    )
                     print(f"Added heading overlay: {heading}")
                 except Exception as e:
                     print(f"Could not add heading overlay: {e}")
                     logger.log_event("warning", {"node": "edit_video", "warning": f"Heading overlay failed: {e}", "heading": heading})
 
-            final_clip_padded.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
-            final_clip_padded.close()
+            final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
             final_clip.close()
 
         original_clip.close()
