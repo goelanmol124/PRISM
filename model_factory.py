@@ -1,6 +1,14 @@
 import os
-from typing import Any, Optional
+from typing import Any, Optional, List
 from langchain_openai import ChatOpenAI
+
+# Recommended free models on OpenRouter (in order of preference)
+OPENROUTER_FREE_MODELS = [
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "mistralai/mistral-7b-instruct:free",
+    "qwen/qwen-2-7b-instruct:free",
+]
 
 class ModelFactory:
     """
@@ -50,12 +58,18 @@ class ModelFactory:
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+        
+        print(f"[ModelFactory] Using OpenRouter model: {model_name}")
             
         return ChatOpenAI(
             model=model_name,
             openai_api_key=api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             temperature=temperature,
+            default_headers={
+                "HTTP-Referer": "https://github.com/prism-video",  # Optional: for OpenRouter analytics
+                "X-Title": "PRISM Video Editor"
+            },
             **kwargs
         )
 
@@ -80,3 +94,8 @@ class ModelFactory:
                 "langchain-google-genai package is not installed. "
                 "Please install it using `pip install langchain-google-genai` to use Gemini models directly."
             )
+    
+    @staticmethod
+    def get_recommended_free_model() -> str:
+        """Returns the first recommended free OpenRouter model."""
+        return OPENROUTER_FREE_MODELS[0]

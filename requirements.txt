@@ -8,3 +8,8 @@ torch
 numpy<2.0
 mediapipe
 opencv-python
+
+# New PRISM enhancements
+librosa            # Advanced audio analysis for music agent
+pillow             # Image processing for caption effects
+pydantic>=2.0      # Data validation for agents

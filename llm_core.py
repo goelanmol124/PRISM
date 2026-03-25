@@ -50,6 +50,29 @@ class AnalysisResult(BaseModel):
 class HeadingResult(BaseModel):
     heading: str = Field(description="A short viral heading, 5-7 words max")
 
+
+class CriticResult(BaseModel):
+    """Result from the Critic Agent evaluating clip selection coherence."""
+    approved: bool = Field(description="Whether the clip selection is approved")
+    coherence_score: int = Field(ge=1, le=10, description="Coherence score from 1-10")
+    narrative_flow: str = Field(description="Assessment of how well clips flow together")
+    context_alignment: str = Field(description="How well clips align with the heading/context")
+    issues: List[str] = Field(default_factory=list, description="List of specific issues found")
+    suggestions: str = Field(description="Specific suggestions for improvement if rejected")
+    
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Handle alternative field names
+            if 'narrative_issues' in data and 'issues' not in data:
+                data['issues'] = data.pop('narrative_issues')
+            if 'feedback' in data and 'suggestions' not in data:
+                data['suggestions'] = data.pop('feedback')
+            if 'score' in data and 'coherence_score' not in data:
+                data['coherence_score'] = data.pop('score')
+        return data
+
 # --- Helper Functions ---
 
 def strip_markdown_json(text: str) -> str:
@@ -92,9 +115,23 @@ def _call_with_manual_parsing(llm: ChatOpenAI, messages: List[BaseMessage], sche
         try:
             response = llm.invoke(messages)
             content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Debug: Print response if it looks problematic
+            if not content or len(content.strip()) < 10:
+                print(f"[LLM] Warning: Empty or very short response received: '{content}'")
+                raise ValueError(f"LLM returned empty or invalid response: '{content}'")
+            
+            # Debug: Show first 200 chars of response
+            print(f"[LLM] Response preview: {content[:200]}...")
+            
             return parse_json_response(content, schema)
+        except json.JSONDecodeError as e:
+            print(f"[LLM] JSON parsing attempt {attempt + 1} failed: {e}")
+            print(f"[LLM] Raw content was: {content[:500] if content else 'EMPTY'}")
+            last_exception = e
+            time.sleep(2 ** attempt)
         except Exception as e:
-            print(f"Manual parsing attempt {attempt + 1} failed: {e}")
+            print(f"[LLM] Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
             last_exception = e
             time.sleep(2 ** attempt)
     raise last_exception
