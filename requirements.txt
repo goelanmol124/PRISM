@@ -6,3 +6,5 @@ moviepy
 python-dotenv
 torch
 numpy<2.0
+mediapipe
+opencv-python

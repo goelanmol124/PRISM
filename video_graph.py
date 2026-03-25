@@ -66,6 +66,7 @@ class VideoState(TypedDict):
     heading: str
     output_video_path: str
     dev_mode: bool  # Development mode: cache transcriptions
+    parameters: Dict[str, Any] # For extensibility/future use
 
 # --- Helper Functions ---
 
@@ -312,15 +313,51 @@ def _resolve_font():
     return None
 
 
-def _crop_to_vertical(clip):
-    """Center-crop a clip to 9:16 aspect ratio and resize to TARGET_WIDTH x TARGET_HEIGHT."""
+def _crop_to_vertical(clip, start_time=None):
+    """Smart center-crop a clip to 9:16 aspect ratio using face tracking (if available)."""
     src_w, src_h = clip.w, clip.h
     src_aspect = src_w / src_h
 
     if src_aspect > TARGET_ASPECT:
-        # Source is wider than 9:16 — crop width (take center vertical strip)
+        # Source is wider than 9:16 — crop width
         new_w = int(src_h * TARGET_ASPECT)
         x_offset = (src_w - new_w) // 2
+
+        # Intelligent face-tracking crop if mediapipe is available
+        try:
+            import cv2
+            import mediapipe as mp
+            import numpy as np
+
+            # Sample a frame from the middle of the clip to find the subject
+            sample_time = clip.duration / 2
+            frame = clip.get_frame(sample_time)
+            
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            mp_face = mp.solutions.face_detection
+            with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+                results = face_detection.process(frame_bgr)
+                if results.detections:
+                    # Find the largest/most prominent face
+                    best_detection = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width)
+                    bbox = best_detection.location_data.relative_bounding_box
+                    
+                    # Calculate center pixel of the face
+                    face_center_x = int((bbox.xmin + bbox.width / 2) * src_w)
+                    
+                    # Align crop window with the face center, clamped to video bounds
+                    x_offset = max(0, min(src_w - new_w, face_center_x - (new_w // 2)))
+                    print(f"[Smart Crop] Found face at x={face_center_x}, adjusting crop offset to {x_offset}")
+
+        except ImportError:
+            print("[Smart Crop] OpenCV or MediaPipe not installed. Falling back to center crop.")
+            pass
+        except Exception as e:
+            print(f"[Smart Crop] OpenCV Error: {e}")
+            pass
+
         clip = clip.cropped(x1=x_offset, y1=0, x2=x_offset + new_w, y2=src_h)
     elif src_aspect < TARGET_ASPECT:
         # Source is taller than 9:16 — crop height
@@ -369,46 +406,58 @@ def edit_video(state: VideoState):
             if end > start:
                 clip = original_clip.subclipped(start, end)
                 
-                # Crop each clip to 9:16 vertical
-                clip = _crop_to_vertical(clip)
+                # Crop each clip to 9:16 vertical, pass start time for debugging if needed
+                clip = _crop_to_vertical(clip, start)
                 
-                # --- Subtitle Overlay Logic ---
+                # --- Dynamic Word-by-Word Subtitle Overlay Logic ---
                 subtitle_clips = []
                 for seg in state["transcript_segments"]:
-                    seg_start = seg["start"]
-                    seg_end = seg["end"]
-                    
-                    overlap_start = max(start, seg_start)
-                    overlap_end = min(end, seg_end)
-                    
-                    if overlap_end > overlap_start:
-                        text = seg["text"].strip()
-                        if not text:
+                    # Try to use word-level timestamps if whisper provided them
+                    words_data = seg.get("words", [])
+                    if not words_data:
+                        # Fallback: if no word-level data, just chunk the segment text
+                        words_data = [{"word": seg["text"], "start": seg["start"], "end": seg["end"]}]
+                        
+                    for word_info in words_data:
+                        word_text = word_info.get("word", "").strip().upper()
+                        if not word_text:
                             continue
                             
-                        sub_start_rel = max(0, seg_start - start)
-                        sub_end_rel = min(clip.duration, seg_end - start)
-                        duration_seg = sub_end_rel - sub_start_rel
+                        word_start = word_info["start"]
+                        word_end = word_info["end"]
                         
-                        if duration_seg > 0.3: 
-                            try:
-                                txt_clip = TextClip(
-                                    text=text,
-                                    font_size=subtitle_font_size,
-                                    color='white',
-                                    font=font_path,
-                                    stroke_color='black',
-                                    stroke_width=subtitle_stroke,
-                                    method='caption',
-                                    size=(int(clip.w * 0.85), None),
-                                    text_align='center'
-                                )
-                                # Position at bottom 12% of frame
-                                sub_y = int(clip.h * 0.82)
-                                txt_clip = txt_clip.with_position(('center', sub_y)).with_start(sub_start_rel).with_duration(duration_seg)
-                                subtitle_clips.append(txt_clip)
-                            except Exception as e:
-                                print(f"Subtitle error: {e}")
+                        overlap_start = max(start, word_start)
+                        overlap_end = min(end, word_end)
+                        
+                        if overlap_end > overlap_start:
+                            sub_start_rel = max(0, overlap_start - start)
+                            sub_end_rel = min(clip.duration, overlap_end - start)
+                            
+                            duration_seg = sub_end_rel - sub_start_rel
+                            if duration_seg > 0:
+                                try:
+                                    # Hormozi-style Word Popping
+                                    text_scale = 1.1 if len(word_text) > 3 else 1.0
+                                    dynamic_font_size = int(subtitle_font_size * 2 * text_scale)
+                                    
+                                    txt_clip = TextClip(
+                                        text=word_text,
+                                        font_size=dynamic_font_size,
+                                        color='yellow', # Viral yellow color
+                                        font=font_path,
+                                        stroke_color='black',
+                                        stroke_width=subtitle_stroke * 3, # Thicker stroke for impact
+                                        method='caption',
+                                        size=(int(TARGET_WIDTH * 0.8), None),
+                                        text_align='center'
+                                    )
+                                    
+                                    # Position directly in the middle (center of the screen)
+                                    txt_clip = txt_clip.with_position(('center', 'center')).with_start(sub_start_rel).with_duration(duration_seg)
+                                    
+                                    subtitle_clips.append(txt_clip)
+                                except Exception as e:
+                                    print(f"Format error on subtitle '{word_text}': {e}")
                 
                 if subtitle_clips:
                     clip = CompositeVideoClip([clip] + subtitle_clips, size=(TARGET_WIDTH, TARGET_HEIGHT))
