@@ -25,6 +25,14 @@ class VideoCut(BaseModel):
         description="Transition type to next clip", 
         default="cut"
     )
+    is_hook: bool = Field(
+        description="Whether this is the hook/opening segment (first 3 seconds are critical)",
+        default=False
+    )
+    energy_level: Literal["low", "medium", "high", "climax"] = Field(
+        description="Energy/intensity level of this segment for zoom/speed effects",
+        default="medium"
+    )
 
     @model_validator(mode='before')
     @classmethod
@@ -43,9 +51,33 @@ class VideoCut(BaseModel):
                 data['reason'] = data.pop('text')
         return data
 
+
+class CaptionWord(BaseModel):
+    """A word with styling information for animated captions."""
+    word: str = Field(description="The word text")
+    is_emphasis: bool = Field(description="Whether this word should be emphasized (larger, different color)", default=False)
+    emoji: Optional[str] = Field(description="Optional emoji to show with this word", default=None)
+
+
+class CaptionGroup(BaseModel):
+    """A group of 2-4 words to display together as animated caption."""
+    words: List[CaptionWord] = Field(description="Words in this caption group")
+    start_time: float = Field(description="Start time in seconds")
+    end_time: float = Field(description="End time in seconds")
+
+
+class CaptionAnalysis(BaseModel):
+    """LLM-analyzed captions with emphasis and emoji suggestions."""
+    groups: List[CaptionGroup] = Field(description="Caption groups for the video")
+
+
 class AnalysisResult(BaseModel):
     cuts: List[VideoCut] = Field(description="List of video cuts with start, end, reason, transition")
     order: Optional[List[int]] = Field(description="Optional order of cuts by index", default=None)
+    hook_segment_index: Optional[int] = Field(
+        description="Index of the segment that should be used as the hook (first 3 seconds are critical for retention)",
+        default=0
+    )
 
 class HeadingResult(BaseModel):
     heading: str = Field(description="A short viral heading, 5-7 words max")
@@ -110,39 +142,39 @@ def call_llm_with_structure(
 
 def _call_with_manual_parsing(llm: ChatOpenAI, messages: List[BaseMessage], schema: Type[T], max_retries: int) -> T:
     """Fallback: call LLM and manually parse JSON response."""
-    last_exception = None
+    last_exception: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
             response = llm.invoke(messages)
-            content = response.content if hasattr(response, 'content') else str(response)
-            
-            # Debug: Print response if it looks problematic
-            if not content or len(content.strip()) < 10:
-                print(f"[LLM] Warning: Empty or very short response received: '{content}'")
-                raise ValueError(f"LLM returned empty or invalid response: '{content}'")
-            
-            # Debug: Show first 200 chars of response
-            print(f"[LLM] Response preview: {content[:200]}...")
-            
+            # Handle different response content types
+            if hasattr(response, 'content'):
+                content = response.content
+                # If content is a list (multimodal response), extract text parts
+                if isinstance(content, list):
+                    text_parts = [part if isinstance(part, str) else part.get("text", "") for part in content]
+                    content = "".join(text_parts)
+                else:
+                    content = str(content)
+            else:
+                content = str(response)
             return parse_json_response(content, schema)
-        except json.JSONDecodeError as e:
-            print(f"[LLM] JSON parsing attempt {attempt + 1} failed: {e}")
-            print(f"[LLM] Raw content was: {content[:500] if content else 'EMPTY'}")
-            last_exception = e
-            time.sleep(2 ** attempt)
         except Exception as e:
-            print(f"[LLM] Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
+            print(f"Manual parsing attempt {attempt + 1} failed: {e}")
             last_exception = e
             time.sleep(2 ** attempt)
-    raise last_exception
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError("Max retries reached with no exception captured")
 
 def _call_with_tenacity(structured_llm: Runnable, messages: List[BaseMessage], max_retries: int):
     """Retries using Tenacity library."""
+    if not HAS_TENACITY:
+        raise ImportError("tenacity is not installed")
     
-    @retry(
-        stop=stop_after_attempt(max_retries),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((ValidationError, ValueError, Exception)),
+    @retry(  # type: ignore[name-defined]
+        stop=stop_after_attempt(max_retries),  # type: ignore[name-defined]
+        wait=wait_exponential(multiplier=1, min=2, max=10),  # type: ignore[name-defined]
+        retry=retry_if_exception_type((ValidationError, ValueError, Exception)),  # type: ignore[name-defined]
         reraise=True
     )
     def invoke():
@@ -152,7 +184,7 @@ def _call_with_tenacity(structured_llm: Runnable, messages: List[BaseMessage], m
 
 def _call_with_simple_retry(structured_llm: Runnable, messages: List[BaseMessage], max_retries: int):
     """Simple retry loop if tenacity is not available."""
-    last_exception = None
+    last_exception: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
             return structured_llm.invoke(messages)
@@ -161,6 +193,8 @@ def _call_with_simple_retry(structured_llm: Runnable, messages: List[BaseMessage
             last_exception = e
             time.sleep(2 ** attempt)
     
-    raise last_exception
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError("Max retries reached with no exception captured")
 
 

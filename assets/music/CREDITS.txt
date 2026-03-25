@@ -1,0 +1,56 @@
+# PRISM Background Music Credits
+
+This folder contains royalty-free background music tracks licensed under 
+Creative Commons for use in PRISM-generated short-form videos.
+
+## Tracks
+
+### cutting-edge.mp3
+- Title: Cutting Edge
+- Artist: Shane Ivers
+- Website: https://www.silvermansound.com
+- License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+- Attribution: Music: Cutting Edge by Shane Ivers - https://www.silvermansound.com
+- Tags: corporate, news, motivational, tech, driving, modern
+
+### spark-of-inspiration.mp3
+- Title: Spark of Inspiration  
+- Artist: Shane Ivers
+- Website: https://www.silvermansound.com
+- License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+- Attribution: Music: Spark of Inspiration by Shane Ivers - https://www.silvermansound.com
+- Tags: corporate, inspirational, uplifting, presentation, motivational
+
+### Aari Aari Dhurandhar The Revenge 128 Kbps.mp3
+- Title: Aari Aari (from Dhurandhar The Revenge)
+- Note: Indian film music - ensure proper licensing for commercial use
+- Tags: Indian, Bollywood, energetic, action
+
+## Usage Notes
+
+1. These tracks are used as background music in PRISM-generated videos
+2. The audio ducking system automatically lowers music volume during speech
+3. Music is selected randomly from available tracks in this folder
+4. Supported formats: .mp3, .wav, .m4a
+
+## License Compliance
+
+When publishing videos created with PRISM that include this music:
+
+1. Include the attribution text in your video description
+2. For CC BY 4.0 tracks, credit is REQUIRED for free use
+3. Pro licenses can be purchased from artist websites for no-attribution use
+
+## Adding New Tracks
+
+Place new royalty-free music files in this folder. Ensure:
+- The track has a compatible license (CC BY, CC0, or purchased license)
+- Update this CREDITS.txt file with attribution information
+- Preferred format: MP3 320kbps or WAV
+
+## Recommended Sources for Additional Tracks
+
+- https://www.silvermansound.com (Shane Ivers - CC BY 4.0)
+- https://www.chosic.com/free-music/corporate/ (Various artists - CC BY)
+- https://maxkomusic.com (MaxKoMusic - license required for monetization)
+- https://freemusicarchive.org (Various licenses)

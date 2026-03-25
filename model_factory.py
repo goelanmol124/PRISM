@@ -1,19 +1,27 @@
 import os
+import base64
 from typing import Any, Optional, List
 from langchain_openai import ChatOpenAI
-
-# Recommended free models on OpenRouter (in order of preference)
-OPENROUTER_FREE_MODELS = [
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "google/gemma-2-9b-it:free",
-    "mistralai/mistral-7b-instruct:free",
-    "qwen/qwen-2-7b-instruct:free",
-]
 
 class ModelFactory:
     """
     Factory class to create instances of LLMs based on the provider.
     """
+    
+    # Vision-capable models
+    VISION_MODELS = {
+        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview"],
+        "openrouter": [
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini", 
+            "anthropic/claude-3.5-sonnet",
+            "anthropic/claude-3-opus",
+            "google/gemini-pro-vision",
+            "google/gemini-1.5-pro",
+            "google/gemini-1.5-flash",
+        ],
+        "gemini": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro-vision"],
+    }
     
     @staticmethod
     def get_model(provider: str, model_name: str, temperature: float = 0.7, **kwargs: Any) -> Any:
@@ -39,6 +47,37 @@ class ModelFactory:
             return ModelFactory._get_gemini_model(model_name, temperature, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
+    
+    @staticmethod
+    def get_vision_model(provider: str = "openrouter", model_name: Optional[str] = None, temperature: float = 0.3) -> Any:
+        """
+        Get a vision-capable model for image analysis.
+        
+        Args:
+            provider: The model provider
+            model_name: Specific model name, or None to auto-select
+            temperature: Temperature for generation
+        
+        Returns:
+            A vision-capable chat model
+        """
+        provider = provider.lower()
+        
+        # Auto-select a vision model if not specified
+        if model_name is None:
+            vision_models = ModelFactory.VISION_MODELS.get(provider, [])
+            if not vision_models:
+                raise ValueError(f"No vision models available for provider: {provider}")
+            model_name = vision_models[0]  # Use first available
+        
+        return ModelFactory.get_model(provider, model_name, temperature)
+    
+    @staticmethod
+    def is_vision_capable(provider: str, model_name: str) -> bool:
+        """Check if a model supports vision/image inputs."""
+        provider = provider.lower()
+        vision_models = ModelFactory.VISION_MODELS.get(provider, [])
+        return model_name in vision_models or any(v in model_name for v in vision_models)
 
     @staticmethod
     def _get_openai_model(model_name: str, temperature: float, **kwargs) -> ChatOpenAI:
@@ -58,18 +97,12 @@ class ModelFactory:
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
-        
-        print(f"[ModelFactory] Using OpenRouter model: {model_name}")
             
         return ChatOpenAI(
             model=model_name,
             openai_api_key=api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             temperature=temperature,
-            default_headers={
-                "HTTP-Referer": "https://github.com/prism-video",  # Optional: for OpenRouter analytics
-                "X-Title": "PRISM Video Editor"
-            },
             **kwargs
         )
 
@@ -94,8 +127,3 @@ class ModelFactory:
                 "langchain-google-genai package is not installed. "
                 "Please install it using `pip install langchain-google-genai` to use Gemini models directly."
             )
-    
-    @staticmethod
-    def get_recommended_free_model() -> str:
-        """Returns the first recommended free OpenRouter model."""
-        return OPENROUTER_FREE_MODELS[0]

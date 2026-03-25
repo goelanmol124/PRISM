@@ -4,7 +4,8 @@ import platform
 import json
 import warnings
 import hashlib
-from typing import TypedDict, List, Any, Dict
+import subprocess
+from typing import TypedDict, List, Any, Dict, Optional, Union, cast
 import datetime
 import uuid
 
@@ -15,18 +16,9 @@ from langgraph.graph import StateGraph, END
 from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
 import whisper
 import torch
-from llm_core import call_llm_with_structure, AnalysisResult, HeadingResult
+from llm_core import call_llm_with_structure, AnalysisResult, HeadingResult, CaptionAnalysis, CaptionGroup, CriticResult
 from model_factory import ModelFactory
-from caption_styler import CaptionStyler, CaptionStyle, create_styled_captions
-from critic_agent import CriticAgent, create_critic_agent
-
-# Optional music agent import
-try:
-    from music_agent import MusicAgent, add_background_music
-    MUSIC_AGENT_AVAILABLE = True
-except ImportError:
-    MUSIC_AGENT_AVAILABLE = False
-    print("[PRISM] Music agent not available. Background music disabled.")
+from critic_agent import CriticAgent
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -42,65 +34,720 @@ if not os.getenv("OPENROUTER_API_KEY"):
 CACHE_DIR = ".dev_cache"
 
 # --- Output Constants ---
-# Production resolution (720p vertical)
-PRODUCTION_WIDTH = 720
-PRODUCTION_HEIGHT = 1280
-
-# Preview resolution (480p vertical) - for fast iteration
-PREVIEW_WIDTH = 480
-PREVIEW_HEIGHT = 854
-
-# Export mode: "preview" for fast iteration, "production" for final quality
-EXPORT_MODE = "preview"  # Change to "production" for final export
-
-# Set resolution based on mode
-if EXPORT_MODE == "preview":
-    TARGET_WIDTH = PREVIEW_WIDTH
-    TARGET_HEIGHT = PREVIEW_HEIGHT
-else:
-    TARGET_WIDTH = PRODUCTION_WIDTH
-    TARGET_HEIGHT = PRODUCTION_HEIGHT
-
+TARGET_WIDTH = 512
+TARGET_HEIGHT = 720
 TARGET_ASPECT = TARGET_WIDTH / TARGET_HEIGHT  # 9:16 = 0.5625
 
-# --- Encoding Settings ---
-# Preview mode: ultra-fast, low quality
-# Production mode: balanced quality/speed
-ENCODING_PRESETS = {
-    "preview": {
-        "codec": "libx264",
-        "preset": "ultrafast",
-        "crf": "32",  # Lower quality, much faster
-        "fps": 20,
-        "threads": 16,
-        "bitrate": None,
-        "audio_bitrate": "64k",
-    },
-    "production": {
-        "codec": "libx264",  # Will try VAAPI first
-        "preset": "fast",
-        "crf": "23",
-        "fps": 30,
-        "threads": 16,
-        "bitrate": None,
-        "audio_bitrate": "128k",
+# --- Performance: Cached OpenCV Face Cascade ---
+_face_cascade: Any = None
+
+# --- Performance: GPU Encoder Detection (cached) ---
+_gpu_encoder: Optional[str] = None
+
+def _get_video_codec() -> str:
+    """Detect best available video codec. Prefers NVENC GPU encoding."""
+    global _gpu_encoder
+    if _gpu_encoder is not None:
+        return _gpu_encoder
+    
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "h264_nvenc" in result.stdout:
+            _gpu_encoder = "h264_nvenc"
+            print("[Performance] Using NVIDIA NVENC GPU encoder")
+            return _gpu_encoder
+    except Exception as e:
+        print(f"[Performance] Could not detect GPU encoder: {e}")
+    
+    _gpu_encoder = "libx264"
+    print("[Performance] Using libx264 CPU encoder")
+    return _gpu_encoder
+
+
+def _get_ffmpeg_params(codec: str) -> tuple:
+    """Get optimal FFmpeg parameters based on codec."""
+    if codec == "h264_nvenc":
+        # NVENC settings: -cq is quality (0-51, lower=better), p4 is balanced preset
+        return ("p4", ["-cq", "23", "-b:v", "0"])
+    else:
+        # libx264 settings: -crf is quality (18-28), fast preset
+        return ("fast", ["-crf", "23"])
+
+def _get_face_cascade() -> Any:
+    """Lazy-load and cache the Haar cascade classifier (expensive to load)."""
+    global _face_cascade
+    if _face_cascade is None:
+        try:
+            import cv2
+            cascade_path: str = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'  # type: ignore[attr-defined]
+            _face_cascade = cv2.CascadeClassifier(cascade_path)
+            print("[Performance] Face cascade loaded and cached.")
+        except Exception as e:
+            print(f"[Performance] Could not load face cascade: {e}")
+            _face_cascade = False  # Mark as failed so we don't retry
+    return _face_cascade if _face_cascade else None
+
+# --- Performance: Pillow-based Text Rendering (replaces slow TextClip/ImageMagick) ---
+_pillow_font_cache = {}
+
+def _get_pillow_font(font_path: Optional[str], font_size: int):
+    """Cache Pillow fonts to avoid repeated disk reads."""
+    from PIL import ImageFont
+    cache_key = (font_path, font_size)
+    if cache_key not in _pillow_font_cache:
+        try:
+            if font_path:
+                _pillow_font_cache[cache_key] = ImageFont.truetype(font_path, font_size)
+            else:
+                _pillow_font_cache[cache_key] = ImageFont.load_default()
+        except Exception:
+            _pillow_font_cache[cache_key] = ImageFont.load_default()
+    return _pillow_font_cache[cache_key]
+
+
+def _render_text_to_array(
+    text: str,
+    font_path: Optional[str],
+    font_size: int,
+    text_color: tuple = (255, 255, 0),      # Yellow (RGB)
+    stroke_color: tuple = (0, 0, 0),         # Black
+    stroke_width: int = 3,
+    max_width: Optional[int] = None,
+    padding: int = 10
+):
+    """
+    Render text to a numpy array with transparency using Pillow.
+    MUCH faster than TextClip which spawns ImageMagick subprocess.
+    
+    Returns: numpy array (H, W, 4) with RGBA channels
+    """
+    from PIL import Image, ImageDraw
+    import numpy as np
+    
+    font = _get_pillow_font(font_path, font_size)
+    
+    # Create a temporary image to measure text size
+    dummy_img = Image.new('RGBA', (1, 1))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+    
+    # Get text bounding box
+    bbox = dummy_draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    text_width = bbox[2] - bbox[0] + padding * 2
+    text_height = bbox[3] - bbox[1] + padding * 2
+    
+    # Clamp to max width if specified
+    if max_width and text_width > max_width:
+        text_width = max_width
+    
+    # Create transparent image
+    img = Image.new('RGBA', (int(text_width), int(text_height)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # Center text in the image
+    x = (text_width - (bbox[2] - bbox[0])) // 2
+    y = (text_height - (bbox[3] - bbox[1])) // 2
+    
+    # Draw text with stroke (outline) then fill
+    draw.text(
+        (x, y), 
+        text, 
+        font=font, 
+        fill=(*text_color, 255),
+        stroke_width=stroke_width,
+        stroke_fill=(*stroke_color, 255)
+    )
+    
+    return np.array(img)
+
+
+def _create_text_image_clip(
+    text: str,
+    font_path: Optional[str],
+    font_size: int,
+    text_color: tuple = (255, 255, 0),
+    stroke_color: tuple = (0, 0, 0),
+    stroke_width: int = 3,
+    max_width: Optional[int] = None,
+    duration: float = 1.0,
+    start_time: float = 0.0,
+    position: tuple = ('center', 'center')
+):
+    """
+    Create a MoviePy ImageClip from Pillow-rendered text.
+    Replacement for TextClip that's 10-50x faster.
+    """
+    from moviepy import ImageClip
+    
+    # Render text to numpy array
+    text_array = _render_text_to_array(
+        text=text,
+        font_path=font_path,
+        font_size=font_size,
+        text_color=text_color,
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        max_width=max_width
+    )
+    
+    # Create ImageClip from the array
+    clip = ImageClip(text_array, is_mask=False, transparent=True)
+    clip = clip.with_duration(duration).with_start(start_time).with_position(position)
+    
+    return clip
+
+
+# --- Animated Caption System ---
+# These functions create TikTok-style animated captions with:
+# - Pop-in animations (scale from small to full size)
+# - Keyword highlighting (different colors for emphasis words)
+# - Multi-word grouping (2-4 words at a time)
+# - Emoji integration
+
+def _ease_out_back(t: float) -> float:
+    """Easing function for bounce/overshoot effect. t in [0,1] -> output in [0, ~1.1]"""
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * pow(t - 1, 3) + c1 * pow(t - 1, 2)
+
+
+def _ease_out_elastic(t: float) -> float:
+    """Elastic bounce easing for more dramatic pop effect."""
+    import math
+    if t == 0:
+        return 0
+    if t == 1:
+        return 1
+    p = 0.3
+    return pow(2, -10 * t) * math.sin((t - p / 4) * (2 * math.pi) / p) + 1
+
+
+def _render_animated_caption_frame(
+    t: float,
+    words: list,  # List of dicts: {word, is_emphasis, emoji}
+    font_path: Optional[str],
+    base_font_size: int,
+    animation_duration: float = 0.15,
+    target_width: int = TARGET_WIDTH,
+    target_height: int = TARGET_HEIGHT
+):
+    """
+    Render a single frame of animated caption.
+    Returns numpy array (H, W, 4) with RGBA.
+    
+    Animation: Scale from 0.7 -> 1.0 with bounce easing over animation_duration.
+    """
+    from PIL import Image, ImageDraw
+    import numpy as np
+    
+    # Calculate animation progress
+    if t < animation_duration:
+        progress = t / animation_duration
+        scale = 0.7 + 0.3 * _ease_out_back(progress)
+        scale = min(scale, 1.1)  # Cap overshoot
+    else:
+        scale = 1.0
+    
+    # Create canvas
+    canvas_w = target_width
+    canvas_h = int(target_height * 0.15)  # Caption area height
+    img = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # Build the caption text with styling
+    # Normal words: Yellow (#FFFF00)
+    # Emphasis words: Cyan (#00FFFF) or Green (#00FF00)
+    # Emojis: Rendered inline
+    
+    # Calculate total text width first for centering
+    scaled_font_size = int(base_font_size * scale)
+    emphasis_font_size = int(scaled_font_size * 1.15)  # Emphasis words 15% larger
+    
+    font_normal = _get_pillow_font(font_path, scaled_font_size)
+    font_emphasis = _get_pillow_font(font_path, emphasis_font_size)
+    
+    # Calculate total width
+    total_width = 0
+    word_widths = []
+    space_width = draw.textbbox((0, 0), " ", font=font_normal)[2]
+    
+    for i, word_info in enumerate(words):
+        word = word_info.get("word", "").upper()
+        is_emphasis = word_info.get("is_emphasis", False)
+        emoji = word_info.get("emoji")
+        
+        font = font_emphasis if is_emphasis else font_normal
+        bbox = draw.textbbox((0, 0), word, font=font, stroke_width=3)
+        w = bbox[2] - bbox[0]
+        word_widths.append((w, word, is_emphasis, emoji, font))
+        total_width += w
+        if i < len(words) - 1:
+            total_width += space_width
+    
+    # Center position
+    x_start = (canvas_w - total_width) // 2
+    y_center = canvas_h // 2
+    
+    # Draw each word
+    x = x_start
+    for w, word, is_emphasis, emoji, font in word_widths:
+        # Color based on emphasis
+        if is_emphasis:
+            text_color = (0, 255, 255, 255)  # Cyan for emphasis
+        else:
+            text_color = (255, 255, 0, 255)  # Yellow for normal
+        
+        # Get vertical position (center text vertically)
+        bbox = draw.textbbox((0, 0), word, font=font, stroke_width=3)
+        text_height = bbox[3] - bbox[1]
+        y = y_center - text_height // 2
+        
+        # Draw with stroke (outline)
+        draw.text(
+            (x, y),
+            word,
+            font=font,
+            fill=text_color,
+            stroke_width=3,
+            stroke_fill=(0, 0, 0, 255)
+        )
+        
+        # Draw emoji if present (to the right of the word)
+        if emoji:
+            try:
+                emoji_bbox = draw.textbbox((0, 0), emoji, font=font_normal)
+                emoji_w = emoji_bbox[2] - emoji_bbox[0]
+                draw.text((x + w + 5, y), emoji, font=font_normal, fill=(255, 255, 255, 255))
+                x += emoji_w + 5
+            except:
+                pass  # Skip emoji if rendering fails
+        
+        x += w + space_width
+    
+    return np.array(img)
+
+
+def _create_animated_caption_clip(
+    words: list,  # List of dicts: {word, is_emphasis, emoji}
+    font_path: Optional[str],
+    base_font_size: int,
+    duration: float,
+    start_time: float,
+    target_width: int = TARGET_WIDTH,
+    target_height: int = TARGET_HEIGHT,
+    y_position: float = 0.55  # Vertical position (0-1, from top)
+):
+    """
+    Create a caption clip for multi-word groups.
+    OPTIMIZED: Uses static ImageClip instead of per-frame VideoClip rendering.
+    This is 50-100x faster than the animated per-frame approach.
+    """
+    from moviepy import ImageClip
+    
+    # Render the static frame (final state of animation)
+    static_frame = _render_animated_caption_frame(
+        t=1.0,  # Fully rendered state
+        words=words,
+        font_path=font_path,
+        base_font_size=base_font_size,
+        target_width=target_width,
+        target_height=target_height
+    )
+    
+    # Create static ImageClip (MUCH faster than VideoClip with make_frame)
+    clip = ImageClip(static_frame, transparent=True)
+    clip = clip.with_duration(duration)
+    clip = clip.with_start(start_time)
+    
+    # Position the caption
+    y_pos = int(target_height * y_position)
+    clip = clip.with_position(('center', y_pos))
+    
+    return clip
+
+
+def _group_words_for_captions(
+    relevant_words: list,
+    words_per_group: int = 3
+) -> list:
+    """
+    Group words into caption groups of 2-4 words each.
+    Returns list of {words: [...], start_time, end_time}
+    """
+    groups = []
+    current_group = []
+    group_start = None
+    group_end = None
+    
+    for word_info in relevant_words:
+        if len(current_group) == 0:
+            group_start = word_info["start"]
+        
+        current_group.append({
+            "word": word_info["word"],
+            "is_emphasis": False,  # Will be enhanced by LLM later
+            "emoji": None
+        })
+        group_end = word_info["end"]
+        
+        if len(current_group) >= words_per_group:
+            groups.append({
+                "words": current_group,
+                "start_time": group_start,
+                "end_time": group_end
+            })
+            current_group = []
+            group_start = None
+    
+    # Don't forget the last group
+    if current_group:
+        groups.append({
+            "words": current_group,
+            "start_time": group_start,
+            "end_time": group_end
+        })
+    
+    return groups
+
+
+# --- Zoom & Ken Burns Effects ---
+# Dynamic zoom effects based on energy level for professional look
+# OPTIMIZED: Uses static crop+resize instead of per-frame Python transforms
+
+def _apply_zoom_effect(
+    clip,
+    energy_level: str = "medium",
+    is_hook: bool = False
+):
+    """
+    Apply zoom effect to a clip based on energy level.
+    OPTIMIZED: Uses static center-crop + resize instead of per-frame transforms.
+    This is 50-100x faster than the per-frame PIL approach.
+    
+    Effects (applied as static zoom):
+    - hook: 1.08x zoom
+    - climax: 1.12x zoom
+    - high: 1.06x zoom
+    - medium: 1.03x zoom
+    - low: No zoom
+    """
+    # Define zoom levels based on energy
+    zoom_configs = {
+        "climax": 1.12,
+        "high": 1.06,
+        "medium": 1.03,
+        "low": 1.0,
     }
-}
+    
+    # Hook gets special treatment
+    if is_hook:
+        zoom = 1.08
+    else:
+        zoom = zoom_configs.get(energy_level, 1.0)
+    
+    # No zoom needed
+    if zoom <= 1.0:
+        return clip
+    
+    # Apply static zoom via crop + resize (FAST)
+    w, h = clip.w, clip.h
+    new_w = int(w / zoom)
+    new_h = int(h / zoom)
+    
+    # Center crop
+    x1 = (w - new_w) // 2
+    y1 = (h - new_h) // 2
+    
+    # Crop and resize back to original dimensions
+    return clip.cropped(x1=x1, y1=y1, x2=x1 + new_w, y2=y1 + new_h).resized((w, h))
 
-# Hardware acceleration settings
-USE_HARDWARE_ENCODING = True  # Try Intel VAAPI first
-VAAPI_DEVICE = "/dev/dri/renderD128"
 
-# --- Caption Style Configuration ---
-# Change this to use different caption styles: TIKTOK, HORMOZI, NEWS, MINIMAL, KARAOKE, IMPACT, GRADIENT
-CAPTION_STYLE = CaptionStyle.HORMOZI
-ENABLE_BACKGROUND_MUSIC = True  # Set to False to disable music
-ENABLE_EMOJIS = False  # Set to True for emoji-enhanced captions
+def _apply_speed_ramp(
+    clip,
+    energy_level: str = "medium"
+):
+    """
+    Apply subtle speed ramping based on energy level.
+    
+    - climax: Slight slow-mo (0.92x) for dramatic effect
+    - high: Normal speed (1.0x)
+    - medium: Normal speed (1.0x)
+    - low: Slight speedup (1.05x) to keep pace
+    """
+    speed_configs = {
+        "climax": 0.92,   # Slight slow-mo for impact
+        "high": 1.0,
+        "medium": 1.0,
+        "low": 1.05,      # Slightly faster for pacing
+    }
+    
+    speed = speed_configs.get(energy_level, 1.0)
+    
+    if speed == 1.0:
+        return clip
+    
+    return clip.with_speed_scaled(speed)
 
-# --- Critic Agent Configuration ---
-ENABLE_CRITIC = True  # Set to False to disable narrative coherence checking
-CRITIC_MAX_RETRIES = 3  # Maximum number of re-analysis attempts
-CRITIC_APPROVAL_THRESHOLD = 7  # Minimum coherence score (1-10) to approve
+
+# --- Background Music & Audio Ducking ---
+# Add background music that automatically ducks when speech is detected
+
+# Directory for background music tracks
+MUSIC_DIR = "assets/music"
+
+def _get_available_music_tracks() -> List[str]:
+    """Get list of available background music files."""
+    if not os.path.exists(MUSIC_DIR):
+        os.makedirs(MUSIC_DIR, exist_ok=True)
+        return []
+    
+    music_extensions = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+    tracks = []
+    for f in os.listdir(MUSIC_DIR):
+        if os.path.splitext(f)[1].lower() in music_extensions:
+            tracks.append(os.path.join(MUSIC_DIR, f))
+    return tracks
+
+
+def _select_music_for_energy(energy_levels: List[str]) -> Optional[str]:
+    """
+    Select appropriate background music based on video energy levels.
+    Returns path to music file or None if no music available.
+    
+    For now, just returns the first available track.
+    Future: match music BPM/mood to video energy.
+    """
+    tracks = _get_available_music_tracks()
+    if not tracks:
+        return None
+    
+    # Simple selection - use first track
+    # TODO: Implement mood matching based on energy_levels
+    return tracks[0]
+
+
+def _create_ducking_envelope(
+    speech_segments: List[dict],
+    total_duration: float,
+    sample_rate: int = 44100,
+    duck_level: float = 0.25,      # Volume during speech (0.25 = 25%)
+    attack_time: float = 0.1,       # Fade down time
+    release_time: float = 0.3      # Fade up time
+):
+    """
+    Create a volume envelope array for ducking music under speech.
+    
+    Returns numpy array of volume multipliers (0-1) for each sample.
+    """
+    import numpy as np
+    
+    total_samples = int(total_duration * sample_rate)
+    envelope = np.ones(total_samples)  # Start at full volume
+    
+    attack_samples = int(attack_time * sample_rate)
+    release_samples = int(release_time * sample_rate)
+    
+    for seg in speech_segments:
+        start_sample = int(seg["start"] * sample_rate)
+        end_sample = int(seg["end"] * sample_rate)
+        
+        # Clamp to valid range
+        start_sample = max(0, min(start_sample, total_samples))
+        end_sample = max(0, min(end_sample, total_samples))
+        
+        if start_sample >= end_sample:
+            continue
+        
+        # Attack (fade down before speech)
+        attack_start = max(0, start_sample - attack_samples)
+        for i in range(attack_start, start_sample):
+            progress = (i - attack_start) / attack_samples if attack_samples > 0 else 1
+            target_vol = 1.0 - progress * (1.0 - duck_level)
+            envelope[i] = min(envelope[i], target_vol)
+        
+        # Duck during speech
+        envelope[start_sample:end_sample] = duck_level
+        
+        # Release (fade up after speech)
+        release_end = min(total_samples, end_sample + release_samples)
+        for i in range(end_sample, release_end):
+            progress = (i - end_sample) / release_samples if release_samples > 0 else 1
+            target_vol = duck_level + progress * (1.0 - duck_level)
+            envelope[i] = min(envelope[i], target_vol)
+    
+    return envelope
+
+
+def _apply_ducking_to_audio(
+    music_clip,
+    envelope,
+    sample_rate: int = 44100
+):
+    """
+    Apply ducking envelope to music audio clip.
+    Returns modified audio clip.
+    """
+    import numpy as np
+    from moviepy import AudioClip
+    
+    original_audio = music_clip.audio
+    if original_audio is None:
+        return music_clip
+    
+    # Get audio as array
+    fps = original_audio.fps or sample_rate
+    
+    def make_frame(t):
+        # Get original audio frame
+        original_frame = original_audio.get_frame(t)
+        
+        # Calculate envelope index
+        if isinstance(t, np.ndarray):
+            indices = (t * sample_rate).astype(int)
+            indices = np.clip(indices, 0, len(envelope) - 1)
+            vol = envelope[indices]
+            # Handle stereo/mono
+            if len(original_frame.shape) > 1:
+                vol = vol.reshape(-1, 1)
+        else:
+            idx = int(t * sample_rate)
+            idx = max(0, min(idx, len(envelope) - 1))
+            vol = envelope[idx]
+        
+        return original_frame * vol
+    
+    ducked_audio = AudioClip(make_frame, duration=music_clip.duration, fps=fps)
+    return music_clip.with_audio(ducked_audio)
+
+
+def _mix_audio_tracks(
+    original_audio,
+    music_audio,
+    music_volume: float = 0.3  # Base music volume (before ducking)
+):
+    """
+    Mix original video audio with background music.
+    Returns combined AudioClip.
+    """
+    from moviepy import CompositeAudioClip
+    
+    if original_audio is None:
+        return music_audio.with_volume_scaled(music_volume) if music_audio else None
+    
+    if music_audio is None:
+        return original_audio
+    
+    # Scale music volume
+    music_scaled = music_audio.with_volume_scaled(music_volume)
+    
+    # Composite the audio tracks
+    return CompositeAudioClip([original_audio, music_scaled])
+
+
+def _add_background_music(
+    video_clip,
+    speech_segments: List[dict],
+    music_path: Optional[str] = None,
+    music_volume: float = 0.3,
+    enable_ducking: bool = True
+):
+    """
+    Add background music to video with automatic ducking during speech.
+    
+    Args:
+        video_clip: The video clip to add music to
+        speech_segments: List of {start, end} dicts for speech timing
+        music_path: Path to music file (or None to auto-select)
+        music_volume: Base volume for music (0-1)
+        enable_ducking: Whether to duck music during speech
+    
+    Returns:
+        Video clip with background music added
+    """
+    from moviepy import AudioFileClip, CompositeAudioClip
+    
+    # Select music track
+    if music_path is None:
+        music_path = _select_music_for_energy([])
+    
+    if music_path is None or not os.path.exists(music_path):
+        print("[Music] No background music available, skipping...")
+        return video_clip
+    
+    try:
+        print(f"[Music] Adding background music: {os.path.basename(music_path)}")
+        
+        # Load music and loop/trim to video duration
+        music_clip = AudioFileClip(music_path)
+        video_duration = video_clip.duration
+        
+        # Loop music if shorter than video
+        if music_clip.duration < video_duration:
+            loops_needed = int(video_duration / music_clip.duration) + 1
+            from moviepy import concatenate_audioclips
+            music_clip = concatenate_audioclips([music_clip] * loops_needed)
+        
+        # Trim to video duration
+        music_clip = music_clip.subclipped(0, video_duration)
+        
+        # Apply ducking if enabled
+        if enable_ducking and speech_segments:
+            print(f"[Music] Applying audio ducking ({len(speech_segments)} speech segments)")
+            envelope = _create_ducking_envelope(
+                speech_segments=speech_segments,
+                total_duration=video_duration,
+                duck_level=0.2,  # Duck to 20% during speech
+                attack_time=0.15,
+                release_time=0.4
+            )
+            # Apply envelope to music
+            music_audio = music_clip
+            # Scale music volume
+            music_audio = music_audio.with_volume_scaled(music_volume)
+            
+            # Create ducked version using numpy
+            import numpy as np
+            
+            def apply_envelope(get_frame, t):
+                frame = get_frame(t)
+                if isinstance(t, np.ndarray):
+                    indices = (t * 44100).astype(int)
+                    indices = np.clip(indices, 0, len(envelope) - 1)
+                    vol = envelope[indices]
+                    if len(frame.shape) > 1:
+                        vol = vol.reshape(-1, 1)
+                else:
+                    idx = int(t * 44100)
+                    idx = max(0, min(idx, len(envelope) - 1))
+                    vol = envelope[idx]
+                return frame * vol
+            
+            from moviepy import AudioClip
+            ducked_music = AudioClip(
+                lambda t: apply_envelope(music_audio.get_frame, t),
+                duration=video_duration,
+                fps=music_audio.fps or 44100
+            )
+        else:
+            ducked_music = music_clip.with_volume_scaled(music_volume)
+        
+        # Mix with original audio
+        original_audio = video_clip.audio
+        if original_audio is not None:
+            mixed_audio = CompositeAudioClip([original_audio, ducked_music])
+            video_clip = video_clip.with_audio(mixed_audio)
+            print("[Music] Background music mixed with ducking")
+        else:
+            video_clip = video_clip.with_audio(ducked_music)
+            print("[Music] Background music added (no original audio)")
+        
+        return video_clip
+        
+    except Exception as e:
+        print(f"[Music] Error adding background music: {e}")
+        return video_clip
 
 # --- Logging Setup ---
 class StructuredLogger:
@@ -132,6 +779,9 @@ class VideoState(TypedDict):
     heading: str
     output_video_path: str
     dev_mode: bool  # Development mode: cache transcriptions
+    export_mode: str  # "preview" or "production" - controls output quality
+    use_critic: bool  # Whether to run critic agent for quality review
+    use_music: bool  # Whether to add background music
     parameters: Dict[str, Any] # For extensibility/future use
 
 # --- Helper Functions ---
@@ -144,157 +794,11 @@ def get_video_hash(video_path: str) -> str:
             hash_md5.update(chunk)
     return hash_md5.hexdigest()[:16]
 
-
-def _check_vaapi_available() -> bool:
-    """Check if Intel VAAPI hardware encoding is available."""
-    import subprocess
-    try:
-        # Check if VAAPI device exists
-        if not os.path.exists(VAAPI_DEVICE):
-            return False
-        
-        # Quick test: try to initialize VAAPI encoder
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-init_hw_device", f"vaapi=va:{VAAPI_DEVICE}",
-             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1", "-vf", "format=nv12,hwupload",
-             "-c:v", "h264_vaapi", "-f", "null", "-"],
-            capture_output=True, timeout=10
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def _encode_video_fast(clip, output_path: str, mode: str = "preview") -> bool:
-    """
-    Encode video with optimized settings. Tries VAAPI hardware encoding first,
-    falls back to optimized libx264 if hardware encoding fails.
-    
-    Args:
-        clip: MoviePy video clip to encode
-        output_path: Output file path
-        mode: "preview" for fast/low quality, "production" for balanced
-        
-    Returns:
-        True if encoding succeeded
-    """
-    import subprocess
-    import tempfile
-    
-    settings = ENCODING_PRESETS.get(mode, ENCODING_PRESETS["preview"])
-    
-    # Try VAAPI hardware encoding first (production mode only, and if enabled)
-    use_vaapi = (
-        USE_HARDWARE_ENCODING and 
-        mode == "production" and 
-        _check_vaapi_available()
-    )
-    
-    if use_vaapi:
-        print(f"   🚀 Using Intel VAAPI hardware encoding")
-        try:
-            # For VAAPI, we need to write frames to pipe and use ffmpeg directly
-            # MoviePy doesn't natively support VAAPI, so we use ffmpeg_params workaround
-            
-            # Write to temp file first, then re-encode with VAAPI
-            temp_output = output_path + ".temp.mp4"
-            clip.write_videofile(
-                temp_output,
-                codec="libx264",
-                preset="ultrafast",  # Fast first pass
-                fps=settings["fps"],
-                threads=settings["threads"],
-                audio_codec="aac",
-                audio_bitrate=settings["audio_bitrate"],
-                ffmpeg_params=["-crf", "28"],  # Reasonable quality for re-encode
-                logger="bar"
-            )
-            
-            # Re-encode with VAAPI (much faster than libx264)
-            print(f"   🔄 Re-encoding with VAAPI hardware acceleration...")
-            vaapi_cmd = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                "-init_hw_device", f"vaapi=va:{VAAPI_DEVICE}",
-                "-i", temp_output,
-                "-vf", "format=nv12,hwupload",
-                "-c:v", "h264_vaapi",
-                "-qp", "24",  # Quality parameter for VAAPI
-                "-c:a", "copy",  # Copy audio (already encoded)
-                output_path
-            ]
-            result = subprocess.run(vaapi_cmd, capture_output=True)
-            
-            # Clean up temp file
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-            
-            if result.returncode == 0:
-                return True
-            else:
-                print(f"   ⚠️  VAAPI encoding failed, falling back to CPU")
-                print(f"   Error: {result.stderr.decode()[:200]}")
-                
-        except Exception as e:
-            print(f"   ⚠️  VAAPI encoding error: {e}, falling back to CPU")
-            if os.path.exists(output_path + ".temp.mp4"):
-                os.remove(output_path + ".temp.mp4")
-    
-    # Fallback: Optimized libx264 CPU encoding
-    print(f"   💻 Using optimized CPU encoding (libx264)")
-    
-    ffmpeg_params = ["-crf", settings["crf"]]
-    
-    # Add tune for faster encoding
-    if mode == "preview":
-        ffmpeg_params.extend(["-tune", "fastdecode"])
-    
-    clip.write_videofile(
-        output_path,
-        codec=settings["codec"],
-        preset=settings["preset"],
-        fps=settings["fps"],
-        threads=settings["threads"],
-        audio_codec="aac",
-        audio_bitrate=settings["audio_bitrate"],
-        ffmpeg_params=ffmpeg_params,
-        logger="bar"
-    )
-    
-    return True
-
-
-def _get_transcript_for_timerange(segments: List[dict], start: float, end: float) -> str:
-    """
-    Extract transcript text for a given time range.
-    
-    Args:
-        segments: List of transcript segments with timing
-        start: Start time in seconds
-        end: End time in seconds
-        
-    Returns:
-        Concatenated transcript text for the time range
-    """
-    text_parts = []
-    for seg in segments:
-        seg_start = seg.get("start", 0)
-        seg_end = seg.get("end", 0)
-        
-        # Check for overlap
-        if seg_start < end and seg_end > start:
-            text_parts.append(seg.get("text", "").strip())
-    
-    return " ".join(text_parts)
-
 # --- Nodes ---
 
 def extract_audio(state: VideoState):
     """Extracts audio from the input video."""
-    print(f"\n{'='*60}")
-    print(f"🔊 EXTRACTING AUDIO")
-    print(f"{'='*60}")
-    print(f"   Input: {state['input_video_path']}")
-    
+    print("--- Extracting Audio ---")
     logger.log_event("node_start", {"node": "extract_audio", "input": {"video_path": state["input_video_path"]}})
     
     video_path = state["input_video_path"]
@@ -302,26 +806,22 @@ def extract_audio(state: VideoState):
     
     try:
         video = VideoFileClip(video_path)
-        print(f"   Video duration: {video.duration:.1f}s")
+        if video.audio is None:
+            raise ValueError("Video has no audio track")
         video.audio.write_audiofile(audio_path, logger=None)
         video.close()
-        
-        print(f"   Output: {audio_path}")
-        print(f"{'='*60}\n")
         
         result = {"audio_path": audio_path}
         logger.log_event("node_end", {"node": "extract_audio", "output": result})
         return result
     except Exception as e:
-        print(f"   ❌ Error: {e}")
+        print(f"Error extracting audio: {e}")
         logger.log_event("node_error", {"node": "extract_audio", "error": str(e)})
         return {"audio_path": None} 
 
 def transcribe_audio(state: VideoState):
     """Transcribes audio using local Whisper model. Always caches transcripts by filename."""
-    print(f"\n{'='*60}")
-    print(f"🎤 TRANSCRIBING AUDIO (Whisper)")
-    print(f"{'='*60}")
+    print("--- Transcribing Audio ---")
     logger.log_event("node_start", {"node": "transcribe_audio", "input": {"audio_path": state["audio_path"]}})
     
     audio_path = state["audio_path"]
@@ -338,23 +838,16 @@ def transcribe_audio(state: VideoState):
     cache_file = os.path.join(CACHE_DIR, f"{video_basename}_transcript.json")
     
     if os.path.exists(cache_file):
-        print(f"   📂 Loading cached transcript: {cache_file}")
+        print(f"[CACHE] Loading cached transcript: {cache_file}")
         logger.log_event("cache_hit", {"node": "transcribe_audio", "cache_file": cache_file})
         with open(cache_file, "r", encoding="utf-8") as f:
             cached = json.load(f)
-        
-        print(f"   Segments: {len(cached['transcript_segments'])}")
-        print(f"   Preview: \"{cached['transcript_text'][:80]}...\"")
-        print(f"{'='*60}\n")
-        
         logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": cached["transcript_text"][:100], "segment_count": len(cached["transcript_segments"]), "from_cache": True}})
         return cached
 
     # Check for GPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"   Device: {device}")
-    print(f"   Model: whisper-base")
-    print(f"   Processing...")
+    print(f"Using device: {device}")
     
     try:
         model = whisper.load_model("base", device=device)
@@ -368,58 +861,28 @@ def transcribe_audio(state: VideoState):
         # Always save to cache
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False)
-        
-        print(f"   ✅ Transcription complete!")
-        print(f"   Segments: {len(result['segments'])}")
-        print(f"   Preview: \"{result['text'][:80]}...\"")
-        print(f"   Cached to: {cache_file}")
-        print(f"{'='*60}\n")
-        
+        print(f"[CACHE] Saved transcript: {cache_file}")
         logger.log_event("cache_save", {"node": "transcribe_audio", "cache_file": cache_file})
+        
         logger.log_event("node_end", {"node": "transcribe_audio", "output": {"transcript_text_preview": result["text"][:100], "segment_count": len(result["segments"])}})
         return output
     except Exception as e:
-        print(f"   ❌ Error transcribing audio: {e}")
+        print(f"Error transcribing audio: {e}")
         logger.log_event("node_error", {"node": "transcribe_audio", "error": str(e)})
         raise e
 
-def analyze_transcript_with_feedback(
-    transcript_text: str,
-    segments: List[dict],
-    critic_feedback: str = None,
-    attempt: int = 1
-) -> List[dict]:
-    """
-    Analyzes transcript using LLM to find viral cuts.
-    Optionally incorporates critic feedback for improved selection.
+def analyze_transcript(state: VideoState):
+    """Analyzes transcript using OpenRouter/LLM to find viral cuts with hook optimization and energy levels."""
+    print("--- Analyzing Transcript (Enhanced) ---")
+    logger.log_event("node_start", {"node": "analyze_transcript", "input": {"transcript_preview": state["transcript_text"][:200]}})
     
-    Args:
-        transcript_text: Full transcript text
-        segments: List of transcript segments with timing
-        critic_feedback: Optional feedback from critic agent for retry
-        attempt: Current attempt number (1-3)
-    
-    Returns:
-        List of cut dictionaries
-    """
-    print(f"\n{'='*60}")
-    print(f"📝 ANALYZING TRANSCRIPT (Attempt {attempt}/3)")
-    print(f"{'='*60}")
-    print(f"   Total segments: {len(segments)}")
-    print(f"   Transcript length: {len(transcript_text)} chars")
-    if critic_feedback:
-        print(f"   ⚠️  Incorporating critic feedback from previous attempt")
-    
-    logger.log_event("node_start", {
-        "node": "analyze_transcript",
-        "attempt": attempt,
-        "has_critic_feedback": critic_feedback is not None
-    })
+    transcript_text = state["transcript_text"]
+    segments = state["transcript_segments"]
     
     # Initialize LLM via ModelFactory
     llm = ModelFactory.get_model(
         provider=os.getenv("LLM_PROVIDER", "openrouter"),
-        model_name=os.getenv("LLM_MODEL", "meta-llama/llama-3.2-3b-instruct:free"),
+        model_name=os.getenv("LLM_MODEL", "z-ai/glm-4.5-air:free"),
         temperature=0.7
     )
     
@@ -427,57 +890,58 @@ def analyze_transcript_with_feedback(
     segment_details = "\n".join([f"[{s['start']:.2f}-{s['end']:.2f}]: {s['text']}" for s in segments])
     
     system_prompt = """
-You are an expert video editor creating viral shorts for Gen Z.
-Select the most engaging segments from the transcript to create a SHORT video.
+You are an ELITE video editor creating VIRAL shorts for Gen Z on TikTok/Reels/Shorts.
+Your goal is to create content that HOOKS viewers in the first 3 seconds and keeps them watching.
 
-⚠️ STRICT DURATION LIMIT: The TOTAL duration of ALL clips combined MUST be 25-30 seconds MAX.
-   - Add up (end - start) for each clip
-   - Total MUST NOT exceed 30 seconds
-   - Aim for 25-30 seconds total
+## HOOK OPTIMIZATION (CRITICAL)
+The first segment MUST be the most attention-grabbing moment. Look for:
+- Shocking statements, surprising facts, or bold claims
+- Questions that create curiosity gaps
+- High-energy moments or emotional peaks
+- Controversial or unexpected content
+- "Wait what?" moments
 
-CRITICAL REQUIREMENTS:
-1. TOTAL DURATION: 25-30 seconds maximum (this is NON-NEGOTIABLE)
-2. Selected clips MUST form a COHERENT NARRATIVE - they should tell a complete story
-3. Clips should have a clear beginning, middle, and end
-4. The viewer should understand the context and message without confusion
-5. Avoid jumping between unrelated topics
-6. Select 2-4 clips that work together (fewer clips = more coherent)
+Mark the hook segment with "is_hook": true.
 
-For each cut, specify transition type to the NEXT clip:
+## ENERGY LEVELS
+For each segment, specify the energy level for dynamic editing effects:
+- "climax": Peak moment, most intense (use for 1-2 segments max)
+- "high": High energy, exciting content
+- "medium": Normal pacing
+- "low": Calm, setup, or transition moments
+
+## TRANSITIONS
 - "cut": Fast-paced (use for 80% of transitions)
-- "crossfade": Smooth flow between topics
-- "fade_to_black": Dramatic pause
+- "crossfade": Smooth flow between topics  
+- "fade_to_black": Dramatic pause before reveal
 
-CRITICAL: You MUST respond with ONLY valid JSON matching this EXACT schema:
+## RULES
+1. Total video length: 30-60 seconds
+2. Hook MUST grab attention in first 3 seconds
+3. Keep 3-7 cuts total
+4. The hook segment should START the video (order[0] should be hook_segment_index)
+5. Build tension -> climax -> resolution arc when possible
+
+CRITICAL: Respond with ONLY valid JSON matching this EXACT schema:
 {
   "cuts": [
-    {"start": 10.5, "end": 18.2, "reason": "Hook intro", "transition": "cut"},
-    {"start": 45.0, "end": 57.1, "reason": "Key moment", "transition": "crossfade"}
+    {"start": 45.0, "end": 48.5, "reason": "Shocking reveal - perfect hook", "transition": "cut", "is_hook": true, "energy_level": "high"},
+    {"start": 10.5, "end": 18.2, "reason": "Context setup", "transition": "crossfade", "is_hook": false, "energy_level": "medium"},
+    {"start": 50.0, "end": 58.0, "reason": "Climax moment", "transition": "cut", "is_hook": false, "energy_level": "climax"}
   ],
-  "order": [0, 1]
+  "order": [0, 1, 2],
+  "hook_segment_index": 0
 }
-
-IMPORTANT: 
-- Use "start" and "end" as field names, NOT "start_time" or "end_time"
-- Keep 2-4 clips total (fewer = more coherent)
-- VERIFY your total duration is under 30 seconds before responding!
 """
     
-    # Build user message, including critic feedback if available
-    user_parts = [f"Here is the video transcript:\n{segment_details}"]
-    
-    if critic_feedback:
-        user_parts.append(f"\n\n⚠️ IMPORTANT - YOUR PREVIOUS SELECTION WAS REJECTED:\n{critic_feedback}")
-        user_parts.append("\nPlease select DIFFERENT clips that address the feedback above and form a more coherent narrative.")
-    
-    user_message = "\n".join(user_parts)
+    user_message = f"Here is the video transcript. Find the HOOK first, then build the narrative:\n{segment_details}"
     
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_message)]
     
     logger.log_event("llm_call", {
         "node": "analyze_transcript", 
-        "attempt": attempt,
-        "has_feedback": critic_feedback is not None
+        "system_prompt": system_prompt, 
+        "user_message_preview": user_message[:500] + "..."
     })
 
     try:
@@ -489,208 +953,32 @@ IMPORTANT:
         # Convert Pydantic model to dict for state
         cuts_data = [cut.dict() for cut in result.cuts]
         
-        # Reorder if 'order' is provided
+        # Reorder if 'order' is provided (hook should be first!)
         if result.order:
             ordered_cuts = [cuts_data[i] for i in result.order if i < len(cuts_data)]
         else:
-            ordered_cuts = cuts_data
+            # If no order provided, ensure hook is first
+            hook_cuts = [c for c in cuts_data if c.get("is_hook")]
+            non_hook_cuts = [c for c in cuts_data if not c.get("is_hook")]
+            ordered_cuts = hook_cuts + non_hook_cuts
         
-        # --- Enforce 30-second maximum duration ---
-        MAX_DURATION = 30.0
-        total_duration = sum(cut['end'] - cut['start'] for cut in ordered_cuts)
+        # Log hook info
+        hook_cut = next((c for c in ordered_cuts if c.get("is_hook")), None)
+        if hook_cut:
+            print(f"[HOOK] Selected hook: {hook_cut['start']:.1f}s - {hook_cut['end']:.1f}s - {hook_cut['reason']}")
         
-        if total_duration > MAX_DURATION:
-            print(f"   ⚠️  Total duration ({total_duration:.1f}s) exceeds {MAX_DURATION}s limit")
-            print(f"   🔧 Trimming clips to fit within {MAX_DURATION}s...")
-            
-            # Strategy: Keep clips but trim them proportionally
-            scale_factor = MAX_DURATION / total_duration
-            trimmed_cuts = []
-            running_duration = 0
-            
-            for cut in ordered_cuts:
-                clip_duration = cut['end'] - cut['start']
-                new_duration = clip_duration * scale_factor
-                
-                # Don't make clips shorter than 3 seconds (too short to be useful)
-                if new_duration < 3.0 and running_duration + 3.0 <= MAX_DURATION:
-                    new_duration = min(3.0, clip_duration)
-                
-                if running_duration + new_duration <= MAX_DURATION:
-                    trimmed_cut = cut.copy()
-                    trimmed_cut['end'] = cut['start'] + new_duration
-                    trimmed_cuts.append(trimmed_cut)
-                    running_duration += new_duration
-                else:
-                    # Can we fit a shortened version?
-                    remaining = MAX_DURATION - running_duration
-                    if remaining >= 3.0:
-                        trimmed_cut = cut.copy()
-                        trimmed_cut['end'] = cut['start'] + remaining
-                        trimmed_cuts.append(trimmed_cut)
-                    break
-            
-            ordered_cuts = trimmed_cuts
-            total_duration = sum(cut['end'] - cut['start'] for cut in ordered_cuts)
-            print(f"   ✅ Trimmed to {total_duration:.1f}s ({len(ordered_cuts)} clips)")
-        
-        # --- Print selected clips with transcript excerpts ---
-        print(f"\n📋 SELECTED CLIPS ({len(ordered_cuts)} total):")
-        print("-" * 50)
-        total_duration = 0
-        for i, cut in enumerate(ordered_cuts):
-            start, end = cut['start'], cut['end']
-            duration = end - start
-            total_duration += duration
-            
-            # Find transcript text for this clip
-            clip_text = _get_transcript_for_timerange(segments, start, end)
-            clip_preview = clip_text[:80] + "..." if len(clip_text) > 80 else clip_text
-            
-            print(f"  Clip {i+1}: [{start:.1f}s - {end:.1f}s] ({duration:.1f}s)")
-            print(f"    Reason: {cut.get('reason', 'N/A')}")
-            print(f"    Transition: {cut.get('transition', 'cut')}")
-            print(f"    Content: \"{clip_preview}\"")
-            print()
-        
-        print(f"📊 Total output duration: {total_duration:.1f}s (max: {MAX_DURATION}s)")
-        print("-" * 50)
-            
-        logger.log_event("node_end", {"node": "analyze_transcript", "output": {"cuts": ordered_cuts, "total_duration": total_duration}})
-        return ordered_cuts
+        logger.log_event("node_end", {"node": "analyze_transcript", "output": {"cuts": ordered_cuts, "hook": hook_cut}})
+        return {"cuts": ordered_cuts}
         
     except Exception as e:
-        print(f"Error analyzing transcript (attempt {attempt}): {e}")
-        logger.log_event("node_error", {"node": "analyze_transcript", "error": str(e), "attempt": attempt})
+        print(f"Error analyzing transcript (retries failed): {e}")
+        logger.log_event("node_error", {"node": "analyze_transcript", "error": str(e)})
         # Fallback: Just take the first 30 seconds if Analysis fails
-        return [{"start": 0, "end": 30, "reason": "Fallback - LLM Failed", "transition": "cut"}]
-
-
-def analyze_with_critic(state: VideoState):
-    """
-    Analyzes transcript with critic feedback loop.
-    
-    This is the main analysis node that:
-    1. Generates initial clip selection
-    2. Has critic evaluate coherence
-    3. Retries with feedback if rejected (up to 3 attempts)
-    4. Returns best selection
-    """
-    transcript_text = state["transcript_text"]
-    segments = state["transcript_segments"]
-    
-    print(f"\n{'='*60}")
-    print(f"🎬 CONTENT ANALYSIS WITH CRITIC EVALUATION")
-    print(f"{'='*60}")
-    print(f"   Critic enabled: {ENABLE_CRITIC}")
-    print(f"   Approval threshold: {CRITIC_APPROVAL_THRESHOLD}/10")
-    print(f"   Max retry attempts: {CRITIC_MAX_RETRIES}")
-    
-    if not ENABLE_CRITIC:
-        # Critic disabled - just do single analysis
-        print("   ⚠️  Critic disabled - using single-pass analysis")
-        cuts = analyze_transcript_with_feedback(transcript_text, segments)
-        return {"cuts": cuts}
-    
-    # Initialize critic agent
-    critic = create_critic_agent(
-        approval_threshold=CRITIC_APPROVAL_THRESHOLD,
-        verbose=True
-    )
-    
-    best_cuts = None
-    best_score = 0
-    critic_feedback = None
-    
-    for attempt in range(1, CRITIC_MAX_RETRIES + 1):
-        # Analyze transcript (with feedback if retry)
-        cuts = analyze_transcript_with_feedback(
-            transcript_text,
-            segments,
-            critic_feedback=critic_feedback,
-            attempt=attempt
-        )
-        
-        # We need a preliminary heading for critic context
-        # Generate a quick heading for critic evaluation
-        preliminary_heading = _generate_quick_heading(transcript_text)
-        
-        print(f"\n{'='*60}")
-        print(f"🔍 CRITIC EVALUATION (Attempt {attempt}/{CRITIC_MAX_RETRIES})")
-        print(f"{'='*60}")
-        print(f"   Evaluating {len(cuts)} clips for narrative coherence...")
-        
-        # Have critic evaluate
-        result, is_approved = critic.critique(
-            cuts=cuts,
-            transcript_segments=segments,
-            transcript_text=transcript_text,
-            heading=preliminary_heading,
-            previous_feedback=critic_feedback,
-            attempt_number=attempt,
-            logger=logger
-        )
-        
-        # Print detailed critic results
-        print(f"\n📊 CRITIC VERDICT:")
-        print(f"   Score: {result.coherence_score}/10 (threshold: {CRITIC_APPROVAL_THRESHOLD})")
-        print(f"   Status: {'✅ APPROVED' if is_approved else '❌ REJECTED'}")
-        print(f"   Narrative Flow: {result.narrative_flow}")
-        print(f"   Context Alignment: {result.context_alignment}")
-        if result.issues:
-            print(f"   Issues Found:")
-            for issue in result.issues:
-                print(f"      • {issue}")
-        if not is_approved and result.suggestions:
-            print(f"   Suggestions: {result.suggestions}")
-        
-        # Track best attempt
-        if result.coherence_score > best_score:
-            best_score = result.coherence_score
-            best_cuts = cuts
-        
-        if is_approved:
-            print(f"\n✅ SELECTION APPROVED on attempt {attempt}")
-            print(f"{'='*60}\n")
-            return {"cuts": cuts}
-        
-        # Prepare feedback for retry
-        critic_feedback = critic.format_feedback_for_retry(result)
-        if attempt < CRITIC_MAX_RETRIES:
-            print(f"\n🔄 Retrying with critic feedback...")
-    
-    # Max retries reached - use best attempt
-    print(f"\n⚠️  MAX RETRIES REACHED")
-    print(f"   Using best attempt with score: {best_score}/10")
-    print(f"   Clips selected: {len(best_cuts) if best_cuts else 0}")
-    print(f"{'='*60}\n")
-    
-    logger.log_event("critic_max_retries", {
-        "best_score": best_score,
-        "cuts_count": len(best_cuts) if best_cuts else 0
-    })
-    
-    return {"cuts": best_cuts or cuts}
-
-
-def _generate_quick_heading(transcript_text: str) -> str:
-    """Generate a quick heading for critic context without full LLM call."""
-    # Simple heuristic: use first 50 chars as context
-    preview = transcript_text[:100].strip()
-    if len(preview) > 50:
-        preview = preview[:50] + "..."
-    return f"Video about: {preview}"
-
-
-def analyze_transcript(state: VideoState):
-    """Legacy wrapper - now uses analyze_with_critic."""
-    return analyze_with_critic(state)
+        return {"cuts": [{"start": 0, "end": 30, "reason": "Fallback - LLM Failed", "transition": "cut", "is_hook": True, "energy_level": "medium"}]}
 
 def generate_heading(state: VideoState):
     """Generates a viral, witty heading for the video using LLM."""
-    print(f"\n{'='*60}")
-    print(f"📰 GENERATING HEADING")
-    print(f"{'='*60}")
+    print("--- Generating Heading ---")
     logger.log_event("node_start", {"node": "generate_heading", "input": {"transcript_preview": state["transcript_text"][:200]}})
     
     transcript_text = state["transcript_text"]
@@ -737,15 +1025,13 @@ Examples:
         result: HeadingResult = call_llm_with_structure(llm, messages, HeadingResult)
         
         heading = result.heading
-        print(f"\n   ✅ Generated: \"{heading}\"")
-        print(f"{'='*60}\n")
+        print(f"Generated Heading: {heading}")
         
         logger.log_event("node_end", {"node": "generate_heading", "output": {"heading": heading}})
         return {"heading": heading}
         
     except Exception as e:
-        print(f"   ❌ Error generating heading: {e}")
-        print(f"   Using fallback heading")
+        print(f"Error generating heading (retries failed): {e}")
         logger.log_event("node_error", {"node": "generate_heading", "error": str(e)})
         return {"heading": "Economics 101"} # Fallback
 
@@ -776,260 +1062,589 @@ def _resolve_font():
     return None
 
 
-def _crop_to_vertical(clip, start_time=None):
-    """Smart center-crop a clip to 9:16 aspect ratio using face tracking (if available)."""
+def _detect_face_offset(clip, new_w, src_w):
+    """Detect face position and return x_offset for cropping. Returns None if no face found."""
+    try:
+        import cv2
+        face_cascade = _get_face_cascade()
+        if face_cascade is None:
+            return None
+            
+        # Sample a frame from the middle of the clip
+        sample_time = clip.duration / 2
+        frame = clip.get_frame(sample_time)
+        
+        # Convert RGB to Grayscale for face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        
+        # Detect faces
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        if len(faces) > 0:
+            # Find the largest face by area
+            largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
+            x, y, w, h = largest_face
+            face_center_x = int(x + w / 2)
+            x_offset = int(max(0, min(src_w - new_w, face_center_x - (new_w // 2))))
+            print(f"[Smart Crop] Found face at x={face_center_x}, crop offset={x_offset}")
+            return x_offset
+    except Exception as e:
+        print(f"[Smart Crop] Face detection error: {e}")
+    return None
+
+
+def _crop_to_vertical(clip, start_time=None, face_x_offset=None, target_w=TARGET_WIDTH, target_h=TARGET_HEIGHT):
+    """Smart center-crop a clip to 9:16 aspect ratio. Optionally uses pre-computed face offset."""
     src_w, src_h = clip.w, clip.h
     src_aspect = src_w / src_h
+    target_aspect = target_w / target_h
 
-    if src_aspect > TARGET_ASPECT:
+    if src_aspect > target_aspect:
         # Source is wider than 9:16 — crop width
-        new_w = int(src_h * TARGET_ASPECT)
-        x_offset = (src_w - new_w) // 2
-
-        # Intelligent face-tracking crop if mediapipe is available
-        try:
-            import cv2
-            import mediapipe as mp
-            import numpy as np
-
-            # Sample a frame from the middle of the clip to find the subject
-            sample_time = clip.duration / 2
-            frame = clip.get_frame(sample_time)
-            
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            mp_face = mp.solutions.face_detection
-            with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-                results = face_detection.process(frame_bgr)
-                if results.detections:
-                    # Find the largest/most prominent face
-                    best_detection = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width)
-                    bbox = best_detection.location_data.relative_bounding_box
-                    
-                    # Calculate center pixel of the face
-                    face_center_x = int((bbox.xmin + bbox.width / 2) * src_w)
-                    
-                    # Align crop window with the face center, clamped to video bounds
-                    x_offset = max(0, min(src_w - new_w, face_center_x - (new_w // 2)))
-                    print(f"[Smart Crop] Found face at x={face_center_x}, adjusting crop offset to {x_offset}")
-
-        except ImportError:
-            print("[Smart Crop] OpenCV or MediaPipe not installed. Falling back to center crop.")
-            pass
-        except Exception as e:
-            print(f"[Smart Crop] OpenCV Error: {e}")
-            pass
+        new_w = int(src_h * target_aspect)
+        
+        # Use provided face offset, or fall back to center crop
+        if face_x_offset is not None:
+            x_offset = face_x_offset
+        else:
+            x_offset = (src_w - new_w) // 2
 
         clip = clip.cropped(x1=x_offset, y1=0, x2=x_offset + new_w, y2=src_h)
-    elif src_aspect < TARGET_ASPECT:
+    elif src_aspect < target_aspect:
         # Source is taller than 9:16 — crop height
-        new_h = int(src_w / TARGET_ASPECT)
+        new_h = int(src_w / target_aspect)
         y_offset = (src_h - new_h) // 2
         clip = clip.cropped(x1=0, y1=y_offset, x2=src_w, y2=y_offset + new_h)
 
     # Resize to exact target resolution
-    clip = clip.resized((TARGET_WIDTH, TARGET_HEIGHT))
+    clip = clip.resized((target_w, target_h))
     return clip
 
 
-def edit_video(state: VideoState):
-    """Cuts and stitches the video with 9:16 vertical format, dynamic captions, transitions, and context heading."""
-    print(f"\n{'='*60}")
-    print(f"🎬 EDITING VIDEO")
-    print(f"{'='*60}")
-    print(f"   Clips to process: {len(state['cuts'])}")
-    print(f"   Heading: \"{state.get('heading', 'N/A')}\"")
-    print(f"   Caption style: {CAPTION_STYLE.value}")
-    print(f"   Background music: {'Enabled' if ENABLE_BACKGROUND_MUSIC else 'Disabled'}")
+def _get_relevant_words_for_cuts(transcript_segments: List[dict], cuts: List[dict]) -> List[dict]:
+    """
+    Pre-filter transcript words to only those overlapping with cuts.
+    This avoids iterating the full transcript for every cut.
+    Returns a flat list of {word, start, end} dicts sorted by start time.
+    """
+    # Build time ranges from cuts
+    cut_ranges = [(max(0, c["start"]), c["end"]) for c in cuts]
     
+    relevant_words = []
+    for seg in transcript_segments:
+        words_data = seg.get("words", [])
+        if not words_data:
+            words_data = [{"word": seg["text"], "start": seg["start"], "end": seg["end"]}]
+        
+        for word_info in words_data:
+            word_start = word_info["start"]
+            word_end = word_info["end"]
+            word_text = word_info.get("word", "").strip()
+            
+            if not word_text:
+                continue
+                
+            # Check if word overlaps with ANY cut
+            for cut_start, cut_end in cut_ranges:
+                if word_start < cut_end and word_end > cut_start:
+                    relevant_words.append({
+                        "word": word_text,
+                        "start": word_start,
+                        "end": word_end
+                    })
+                    break  # Don't add same word multiple times
+    
+    return sorted(relevant_words, key=lambda w: w["start"])
+
+
+# --- Vision LLM Integration ---
+# Analyze video keyframes using vision-capable LLMs for better context understanding
+
+def _extract_keyframes(
+    video_path: str,
+    num_frames: int = 5,
+    uniform: bool = True
+) -> List[str]:
+    """
+    Extract keyframes from video and save as temporary images.
+    
+    Args:
+        video_path: Path to video file
+        num_frames: Number of frames to extract
+        uniform: If True, extract uniformly distributed frames
+    
+    Returns:
+        List of paths to extracted frame images
+    """
+    import numpy as np
+    from PIL import Image
+    
+    frame_paths: List[str] = []
+    cache_dir = os.path.join(CACHE_DIR, "keyframes")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    try:
+        clip = VideoFileClip(video_path)
+        duration = clip.duration
+        
+        # Calculate frame times
+        if uniform:
+            times = np.linspace(0.1, duration - 0.1, num_frames)
+        else:
+            # Focus on beginning (hook), middle, and end
+            times = [
+                duration * 0.05,   # Near start (hook)
+                duration * 0.25,   # First quarter
+                duration * 0.5,    # Middle
+                duration * 0.75,   # Third quarter
+                duration * 0.95,   # Near end
+            ][:num_frames]
+        
+        for i, t in enumerate(times):
+            frame = clip.get_frame(t)
+            img = Image.fromarray(frame)
+            
+            # Resize for efficient API calls (max 1024px)
+            max_dim = 1024
+            if max(img.size) > max_dim:
+                ratio = max_dim / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            frame_path = os.path.join(cache_dir, f"keyframe_{i}.jpg")
+            img.save(frame_path, "JPEG", quality=85)
+            frame_paths.append(frame_path)
+        
+        clip.close()
+        print(f"[Vision] Extracted {len(frame_paths)} keyframes")
+        return frame_paths
+        
+    except Exception as e:
+        print(f"[Vision] Error extracting keyframes: {e}")
+        return []
+
+
+def _encode_image_base64(image_path: str) -> str:
+    """Encode image file to base64 string."""
+    import base64
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _analyze_keyframes_with_vision(
+    frame_paths: List[str],
+    transcript_preview: str = ""
+) -> Dict[str, Any]:
+    """
+    Analyze keyframes using a vision LLM to understand visual context.
+    
+    Returns dict with:
+        - scene_description: Overall description of the video
+        - visual_elements: Key visual elements detected
+        - suggested_hooks: Visual moments that could be hooks
+        - mood: Detected mood/tone
+        - b_roll_detected: Whether B-roll footage is present
+    """
+    if not frame_paths:
+        return {"error": "No frames to analyze"}
+    
+    try:
+        # Get vision model
+        vision_provider = os.getenv("VISION_PROVIDER", "openrouter")
+        vision_model = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
+        
+        llm = ModelFactory.get_model(
+            provider=vision_provider,
+            model_name=vision_model,
+            temperature=0.3
+        )
+        
+        # Build multimodal message with images
+        image_contents = []
+        for path in frame_paths[:4]:  # Limit to 4 frames to control costs
+            b64 = _encode_image_base64(path)
+            image_contents.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+            })
+        
+        system_prompt = """You are a video analysis expert helping create viral short-form content.
+Analyze these keyframes from a video and provide insights that will help edit it into an engaging short.
+
+Respond with JSON in this exact format:
+{
+    "scene_description": "Brief description of what's happening in the video",
+    "visual_elements": ["list", "of", "key", "visual", "elements"],
+    "visual_hooks": ["moments that would grab attention visually"],
+    "mood": "detected mood/tone (e.g., serious, funny, dramatic, educational)",
+    "has_broll": true/false,
+    "speaker_visible": true/false,
+    "suggested_emoji": ["relevant", "emojis"],
+    "color_mood": "warm/cool/neutral/vibrant"
+}"""
+
+        text_content = f"""Analyze these video keyframes.
+
+Transcript preview: {transcript_preview[:500] if transcript_preview else 'Not available'}
+
+What visual elements, mood, and hook-worthy moments do you see?"""
+
+        # Create message with images and text
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=[
+                {"type": "text", "text": text_content},
+                *image_contents
+            ])
+        ]
+        
+        logger.log_event("llm_call", {
+            "node": "vision_analysis",
+            "model": vision_model,
+            "num_frames": len(frame_paths)
+        })
+        
+        response = llm.invoke(messages)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Parse JSON response
+        import re
+        
+        # Strip markdown if present
+        content_str = str(content).strip()
+        if content_str.startswith("```"):
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', content_str, re.DOTALL)
+            if match:
+                content_str = match.group(1)
+        
+        result = json.loads(content_str)
+        
+        logger.log_event("llm_response", {
+            "node": "vision_analysis",
+            "result": result
+        })
+        
+        print(f"[Vision] Analysis complete: {result.get('mood', 'unknown')} mood, "
+              f"{len(result.get('visual_elements', []))} visual elements detected")
+        
+        return result
+        
+    except Exception as e:
+        print(f"[Vision] Error analyzing keyframes: {e}")
+        logger.log_event("node_error", {"node": "vision_analysis", "error": str(e)})
+        return {"error": str(e)}
+
+
+def analyze_video_visually(state: VideoState) -> dict:
+    """
+    LangGraph node to analyze video visually using Vision LLM.
+    Extracts keyframes and analyzes them for visual context.
+    """
+    print("--- Analyzing Video Visually ---")
+    logger.log_event("node_start", {"node": "analyze_visually"})
+    
+    video_path = state["input_video_path"]
+    transcript = state.get("transcript_text", "")
+    
+    # Check if vision analysis is enabled
+    enable_vision = os.getenv("ENABLE_VISION_ANALYSIS", "true").lower() == "true"
+    
+    if not enable_vision:
+        print("[Vision] Vision analysis disabled via ENABLE_VISION_ANALYSIS env var")
+        return {"parameters": {**state.get("parameters", {}), "vision_analysis": None}}
+    
+    # Extract keyframes
+    frame_paths = _extract_keyframes(video_path, num_frames=5)
+    
+    if not frame_paths:
+        print("[Vision] No keyframes extracted, skipping vision analysis")
+        return {"parameters": {**state.get("parameters", {}), "vision_analysis": None}}
+    
+    # Analyze with vision LLM
+    analysis = _analyze_keyframes_with_vision(frame_paths, transcript)
+    
+    # Store in parameters for later use
+    updated_params = {**state.get("parameters", {}), "vision_analysis": analysis}
+    
+    logger.log_event("node_end", {"node": "analyze_visually", "output": analysis})
+    
+    return {"parameters": updated_params}
+
+
+def edit_video(state: VideoState):
+    """Cuts and stitches the video with 9:16 vertical format, subtitles, transitions, and context heading.
+    
+    PERFORMANCE OPTIMIZATIONS:
+    - Pre-filters transcript segments to only relevant words
+    - Caches face detection (runs once per video, not per cut)
+    - Uses Pillow for text rendering (10-50x faster than TextClip/ImageMagick)
+    - Uses optimized FFmpeg encoding settings (threads, preset)
+    - Flattened composition structure
+    """
+    print("--- Editing Video ---")
     logger.log_event("node_start", {"node": "edit_video", "input": {"cuts_count": len(state["cuts"]), "heading": state.get("heading")}})
     
     video_path = state["input_video_path"]
     cuts = state["cuts"]
     output_path = "output.mp4"
     
+    # --- Export mode settings ---
+    export_mode = state.get("export_mode", "preview")
+    if export_mode == "production":
+        target_width = 1080
+        target_height = 1920
+        print("🎬 [PRODUCTION] Exporting at 1080x1920")
+    else:
+        target_width = TARGET_WIDTH  # 512
+        target_height = TARGET_HEIGHT  # 720
+        print("⚡ [PREVIEW] Exporting at 512x720")
+    
+    target_aspect = target_width / target_height
+    
+    # --- 30-second duration limit for short-form content ---
+    MAX_DURATION = 30.0
+    total_duration = sum(max(0, cut["end"] - cut["start"]) for cut in cuts)
+    
+    if total_duration > MAX_DURATION:
+        print(f"⚠️ Total duration ({total_duration:.1f}s) exceeds {MAX_DURATION}s limit, trimming cuts...")
+        trimmed_cuts = []
+        accumulated = 0.0
+        for cut in cuts:
+            cut_duration = cut["end"] - cut["start"]
+            if accumulated + cut_duration <= MAX_DURATION:
+                trimmed_cuts.append(cut)
+                accumulated += cut_duration
+            elif accumulated < MAX_DURATION:
+                # Partially include this cut
+                remaining = MAX_DURATION - accumulated
+                trimmed_cuts.append({**cut, "end": cut["start"] + remaining})
+                accumulated = MAX_DURATION
+                break
+        cuts = trimmed_cuts
+        print(f"✅ Trimmed to {len(cuts)} cuts ({accumulated:.1f}s total)")
+    
     # MoviePy imports
     from moviepy.video import fx as vfx
-    from moviepy import TextClip, CompositeVideoClip, VideoFileClip
+    from moviepy import CompositeVideoClip, VideoFileClip
     import numpy as np
-    
-    # Initialize caption styler
-    caption_styler = CaptionStyler(
-        style=CAPTION_STYLE,
-        target_width=TARGET_WIDTH,
-        target_height=TARGET_HEIGHT,
-        enable_emojis=ENABLE_EMOJIS
-    )
 
     try:
         original_clip = VideoFileClip(video_path)
-        clips = []
         
         font_path = _resolve_font()
 
         # --- Font sizes proportional to target output width ---
-        heading_font_size = max(18, int(TARGET_WIDTH * 0.04))     # ~43px on 1080w
-        heading_stroke = max(1, int(TARGET_WIDTH * 0.0025))       # ~3px
+        subtitle_font_size = max(16, int(target_width * 0.035))   # ~38px on 1080w
+        heading_font_size = max(18, int(target_width * 0.04))     # ~43px on 1080w
+        subtitle_stroke = max(1, int(target_width * 0.002))       # ~2px
+        heading_stroke = max(1, int(target_width * 0.0025))       # ~3px
 
-        # 1. First Pass: Create all subclips and overlay styled subtitles
-        print(f"\n📎 PROCESSING CLIPS:")
-        print("-" * 50)
+        # --- OPTIMIZATION 1: Pre-filter transcript to only relevant words ---
+        print("[Performance] Pre-filtering transcript segments...")
+        relevant_words = _get_relevant_words_for_cuts(state["transcript_segments"], cuts)
+        print(f"[Performance] Filtered to {len(relevant_words)} relevant words (from full transcript)")
+
+        # --- OPTIMIZATION 2: Detect face ONCE on the original video ---
+        src_w, src_h = original_clip.w, original_clip.h
+        src_aspect = src_w / src_h
+        face_x_offset = None
+        if src_aspect > target_aspect:
+            new_w = int(src_h * target_aspect)
+            # Run face detection once on a sample from the middle of the video
+            sample_clip = original_clip.subclipped(original_clip.duration * 0.4, min(original_clip.duration * 0.6, original_clip.duration))
+            face_x_offset = _detect_face_offset(sample_clip, new_w, src_w)
+            if face_x_offset is None:
+                face_x_offset = (src_w - new_w) // 2  # Fall back to center
+                print("[Performance] Using center crop (no face detected)")
+            else:
+                print(f"[Performance] Face detected once, reusing offset={face_x_offset} for all cuts")
+
+        # --- OPTIMIZATION 3: Create ANIMATED CAPTIONS with multi-word groups ---
+        # Using Pillow-based rendering with pop-in animations
+        all_subtitle_clips = []
+        video_clips = []
+        cumulative_time = 0.0  # Track position in final video timeline
         
-        for idx, cut in enumerate(cuts):
-            start = cut["start"]
-            end = cut["end"]
-            start = max(0, start)
-            end = min(original_clip.duration, end)
-            duration = end - start
-            
-            print(f"   Clip {idx+1}/{len(cuts)}: [{start:.1f}s - {end:.1f}s] ({duration:.1f}s)")
-            print(f"      Reason: {cut.get('reason', 'N/A')}")
+        # Group words for display (2-4 words per group for readability)
+        caption_groups = _group_words_for_captions(relevant_words, words_per_group=3)
+        print(f"[Captions] Created {len(caption_groups)} caption groups from {len(relevant_words)} words")
+        
+        print("[Performance] Rendering ANIMATED captions with Pillow...")
+        for cut in cuts:
+            start = max(0, cut["start"])
+            end = min(original_clip.duration, cut["end"])
+            energy_level = cut.get("energy_level", "medium")
+            is_hook = cut.get("is_hook", False)
             
             if end > start:
                 clip = original_clip.subclipped(start, end)
+                clip = _crop_to_vertical(clip, start, face_x_offset, target_width, target_height)
                 
-                # Crop each clip to 9:16 vertical, pass start time for debugging if needed
-                clip = _crop_to_vertical(clip, start)
+                # --- Apply Zoom & Ken Burns Effects based on energy ---
+                clip = _apply_zoom_effect(clip, energy_level=energy_level, is_hook=is_hook)
                 
-                # --- Dynamic Styled Caption Overlay using CaptionStyler ---
-                subtitle_clips = create_styled_captions(
-                    transcript_segments=state["transcript_segments"],
-                    clip_start=start,
-                    clip_end=end,
-                    style=CAPTION_STYLE,
-                    font_path=font_path,
-                    target_width=TARGET_WIDTH,
-                    target_height=TARGET_HEIGHT,
-                    enable_emojis=ENABLE_EMOJIS
-                )
+                # --- Apply Speed Ramping for dramatic moments ---
+                clip = _apply_speed_ramp(clip, energy_level=energy_level)
                 
-                if subtitle_clips:
-                    clip = CompositeVideoClip([clip] + subtitle_clips, size=(TARGET_WIDTH, TARGET_HEIGHT))
-                    print(f"      Captions: {len(subtitle_clips)} text overlays added")
+                clip_duration = clip.duration
                 
-                clips.append(clip)
+                # Find caption groups that overlap with this cut
+                for group in caption_groups:
+                    group_start = group["start_time"]
+                    group_end = group["end_time"]
+                    
+                    overlap_start = max(start, group_start)
+                    overlap_end = min(end, group_end)
+                    
+                    if overlap_end > overlap_start:
+                        # Calculate position relative to this clip, then offset by cumulative time
+                        sub_start_rel = max(0, overlap_start - start) + cumulative_time
+                        sub_end_rel = min(clip_duration, overlap_end - start) + cumulative_time
+                        duration_seg = sub_end_rel - sub_start_rel
+                        
+                        if duration_seg > 0.1:  # Minimum duration for readability
+                            try:
+                                # Increase font size for high energy segments
+                                energy_scale = {"low": 0.9, "medium": 1.0, "high": 1.1, "climax": 1.2}
+                                base_size = int(subtitle_font_size * 2 * energy_scale.get(energy_level, 1.0))
+                                
+                                # Create animated caption clip
+                                caption_clip = _create_animated_caption_clip(
+                                    words=group["words"],
+                                    font_path=font_path,
+                                    base_font_size=base_size,
+                                    duration=duration_seg,
+                                    start_time=sub_start_rel,
+                                    target_width=target_width,
+                                    target_height=target_height,
+                                    y_position=0.55  # Slightly below center
+                                )
+                                all_subtitle_clips.append(caption_clip)
+                            except Exception as e:
+                                print(f"Error creating animated caption: {e}")
+                                # Fallback to simple text
+                                words_text = " ".join([w["word"].upper() for w in group["words"]])
+                                txt_clip = _create_text_image_clip(
+                                    text=words_text,
+                                    font_path=font_path,
+                                    font_size=int(subtitle_font_size * 2),
+                                    text_color=(255, 255, 0),
+                                    stroke_color=(0, 0, 0),
+                                    stroke_width=subtitle_stroke * 3,
+                                    max_width=int(target_width * 0.8),
+                                    duration=duration_seg,
+                                    start_time=sub_start_rel,
+                                    position=('center', 'center')
+                                )
+                                all_subtitle_clips.append(txt_clip)
+                
+                video_clips.append(clip)
+                cumulative_time += clip_duration
         
-        print("-" * 50)
+        print(f"[Performance] Created {len(all_subtitle_clips)} animated caption clips")
         
-        if clips:
+        if video_clips:
+            # Apply Transitions
             final_clips_with_effects = []
-            
-            # 2. Apply Transitions
-            for i in range(len(clips)):
-                current_clip = clips[i]
+            for i in range(len(video_clips)):
+                current_clip = video_clips[i]
                 transition_type = cuts[i].get("transition", "cut") if i < len(cuts) else "cut"
                 
-                if i < len(clips) - 1:
-                    next_clip = clips[i+1]
+                if i < len(video_clips) - 1:
+                    next_clip = video_clips[i+1]
                     
                     if transition_type == "crossfade":
                         min_dur = min(current_clip.duration, next_clip.duration)
                         duration = min(1.0, min_dur / 2.0)
                         current_clip = current_clip.with_effects([vfx.FadeOut(duration)])
-                        clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
+                        video_clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
                     elif transition_type == "fade_to_black":
                         duration = 0.5
                         current_clip = current_clip.with_effects([vfx.FadeOut(duration)])
-                        clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
+                        video_clips[i+1] = next_clip.with_effects([vfx.FadeIn(duration)])
                 
                 final_clips_with_effects.append(current_clip)
             
             print(f"Concatenating {len(final_clips_with_effects)} clips")
-            final_clip = concatenate_videoclips(final_clips_with_effects, method="compose")
+            base_video = concatenate_videoclips(final_clips_with_effects, method="compose")
             
-            # 3. Semi-transparent top bar for heading (8% of height)
-            bar_height = int(TARGET_HEIGHT * 0.08)  # ~154px on 1920h
+            # --- OPTIMIZATION 4: Single flat CompositeVideoClip for all overlays ---
+            overlay_clips = []
             
+            # Add heading overlay (also using Pillow)
             heading = state.get("heading")
+            bar_height = int(target_height * 0.08)
             if heading:
                 try:
-                    # Create a semi-transparent dark gradient bar
-                    def make_gradient_frame(t):
-                        """Creates a top-to-bottom dark gradient bar with alpha."""
-                        frame = np.zeros((bar_height, TARGET_WIDTH, 3), dtype=np.uint8)
-                        for row in range(bar_height):
-                            # Gradient from opacity ~0.85 at top to ~0.3 at bottom
-                            alpha = 0.85 - (0.55 * row / bar_height)
-                            frame[row, :] = int(alpha * 255 * 0.15)  # Dark tint
-                        return frame
-                    
-                    gradient_bar = ColorClip(size=(TARGET_WIDTH, bar_height), color=(0, 0, 0))
-                    gradient_bar = gradient_bar.with_opacity(0.65).with_duration(final_clip.duration)
+                    gradient_bar = ColorClip(size=(target_width, bar_height), color=(0, 0, 0))
+                    gradient_bar = gradient_bar.with_opacity(0.65).with_duration(base_video.duration)
                     gradient_bar = gradient_bar.with_position((0, 0))
+                    overlay_clips.append(gradient_bar)
                     
-                    heading_clip = TextClip(
-                        text=heading, 
-                        font_size=heading_font_size, 
-                        color='white', 
-                        font=font_path,
-                        stroke_color='black', 
+                    # Use Pillow-based heading (FAST)
+                    heading_clip = _create_text_image_clip(
+                        text=heading,
+                        font_path=font_path,
+                        font_size=heading_font_size,
+                        text_color=(255, 255, 255),  # White
+                        stroke_color=(0, 0, 0),      # Black
                         stroke_width=heading_stroke,
-                        method='caption', 
-                        size=(int(TARGET_WIDTH * 0.9), bar_height),
-                        text_align='center' 
+                        max_width=int(target_width * 0.9),
+                        duration=base_video.duration,
+                        start_time=0,
+                        position=('center', bar_height // 4)  # Vertically center in bar
                     )
-                    heading_clip = heading_clip.with_position(('center', 0)).with_duration(final_clip.duration)
-                    
-                    final_clip = CompositeVideoClip(
-                        [final_clip, gradient_bar, heading_clip],
-                        size=(TARGET_WIDTH, TARGET_HEIGHT)
-                    )
+                    overlay_clips.append(heading_clip)
                     print(f"Added heading overlay: {heading}")
                 except Exception as e:
                     print(f"Could not add heading overlay: {e}")
                     logger.log_event("warning", {"node": "edit_video", "warning": f"Heading overlay failed: {e}", "heading": heading})
 
-            # 4. Add background music with audio ducking (if enabled and available)
-            if ENABLE_BACKGROUND_MUSIC and MUSIC_AGENT_AVAILABLE:
-                try:
-                    print(f"\n🎵 ADDING BACKGROUND MUSIC")
-                    print("-" * 50)
-                    llm = ModelFactory.get_model(
-                        provider=os.getenv("LLM_PROVIDER", "openrouter"),
-                        model_name=os.getenv("LLM_MODEL", "meta-llama/llama-3.2-3b-instruct:free"),
-                        temperature=0.7
-                    )
-                    final_clip = add_background_music(
-                        video_clip=final_clip,
-                        transcript_segments=state["transcript_segments"],
-                        transcript_text=state["transcript_text"],
-                        llm=llm,
-                        logger=logger
-                    )
-                    print("-" * 50)
-                except Exception as e:
-                    print(f"   ⚠️  Could not add background music: {e}")
-                    logger.log_event("warning", {"node": "edit_video", "warning": f"Background music failed: {e}"})
+            # Combine base video + all overlays in ONE CompositeVideoClip
+            if overlay_clips or all_subtitle_clips:
+                final_clip = CompositeVideoClip(
+                    [base_video] + overlay_clips + all_subtitle_clips,
+                    size=(target_width, target_height)
+                )
+            else:
+                final_clip = base_video
 
-            print(f"\n📹 ENCODING FINAL VIDEO ({EXPORT_MODE.upper()} MODE)")
-            print("-" * 50)
-            settings = ENCODING_PRESETS[EXPORT_MODE]
-            print(f"   Output: {output_path}")
-            print(f"   Mode: {EXPORT_MODE}")
-            print(f"   Resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}")
-            print(f"   Duration: {final_clip.duration:.1f}s")
-            print(f"   FPS: {settings['fps']}")
-            print(f"   Preset: {settings['preset']}")
-            print(f"   CRF: {settings['crf']} (higher = faster/smaller)")
-            print(f"   Threads: {settings['threads']}")
-            if EXPORT_MODE == "production" and USE_HARDWARE_ENCODING:
-                print(f"   Hardware: VAAPI enabled (will try Intel GPU)")
-            print("-" * 50)
+            # --- Add Background Music with Ducking ---
+            # Create speech segments from cuts for audio ducking
+            speech_segments = []
+            cumulative = 0.0
+            for cut in cuts:
+                start = max(0, cut["start"])
+                end = min(original_clip.duration, cut["end"])
+                if end > start:
+                    duration = end - start
+                    speech_segments.append({
+                        "start": cumulative,
+                        "end": cumulative + duration
+                    })
+                    cumulative += duration
             
-            # Use optimized encoding with VAAPI fallback
-            _encode_video_fast(final_clip, output_path, mode=EXPORT_MODE)
+            final_clip = _add_background_music(
+                final_clip,
+                speech_segments=speech_segments,
+                music_volume=0.25,  # 25% base volume
+                enable_ducking=True
+            )
+
+            # --- OPTIMIZATION 5: GPU-accelerated FFmpeg encoding (NVENC) ---
+            video_codec = _get_video_codec()
+            preset, ffmpeg_params = _get_ffmpeg_params(video_codec)
             
-            print(f"\n{'='*60}")
-            print(f"✅ VIDEO COMPLETE!")
-            print(f"{'='*60}")
-            print(f"   Output file: {output_path}")
-            print(f"   Duration: {final_clip.duration:.1f}s")
-            print(f"   Mode: {EXPORT_MODE}")
-            if EXPORT_MODE == "preview":
-                print(f"   💡 Tip: Set EXPORT_MODE='production' for final quality")
-            print(f"{'='*60}\n")
-            
+            print(f"[Performance] Writing video with {video_codec} encoder...")
+            final_clip.write_videofile(
+                output_path, 
+                codec=video_codec,
+                audio_codec="aac",
+                preset=preset,
+                threads=0,  # Auto-detect optimal thread count
+                ffmpeg_params=ffmpeg_params,
+                logger=None
+            )
             final_clip.close()
 
         original_clip.close()
@@ -1041,21 +1656,69 @@ def edit_video(state: VideoState):
         logger.log_event("node_error", {"node": "edit_video", "error": str(e)})
         raise e
 
+
+def run_critic(state: VideoState) -> dict:
+    """Run critic agent to review and potentially refine cuts."""
+    print("--- 🎭 Running Critic Agent ---")
+    logger.log_event("node_start", {"node": "run_critic", "input": {"cuts_count": len(state["cuts"])}})
+    
+    if not state.get("use_critic", True):
+        print("Critic agent disabled, skipping...")
+        logger.log_event("node_skip", {"node": "run_critic", "reason": "disabled"})
+        return {}
+    
+    try:
+        llm = ModelFactory.get_model()
+        critic = CriticAgent(llm)
+        
+        # Run critique on current cuts
+        critique = critic.critique_cuts(
+            cuts=state["cuts"],
+            transcript_text=state["transcript_text"],
+            transcript_segments=state["transcript_segments"]
+        )
+        
+        if critique.approved:
+            print(f"✅ Critic approved cuts (score: {critique.overall_score}/10)")
+            logger.log_event("node_end", {"node": "run_critic", "approved": True, "score": critique.overall_score})
+            return {}
+        
+        # If not approved and refinements suggested, apply them
+        if critique.suggested_refinements:
+            print(f"🔄 Critic suggested {len(critique.suggested_refinements)} refinements")
+            refined_cuts = critic.apply_refinements(state["cuts"], critique.suggested_refinements)
+            logger.log_event("node_end", {"node": "run_critic", "approved": False, "refinements": len(critique.suggested_refinements)})
+            return {"cuts": refined_cuts}
+        
+        logger.log_event("node_end", {"node": "run_critic", "approved": False, "no_refinements": True})
+        return {}
+        
+    except Exception as e:
+        print(f"⚠️ Critic agent failed: {e}, continuing with original cuts")
+        logger.log_event("node_error", {"node": "run_critic", "error": str(e)})
+        return {}
+
+
 # --- Graph Construction ---
 
 workflow = StateGraph(VideoState)
 
 workflow.add_node("extract_audio", extract_audio)
 workflow.add_node("transcribe", transcribe_audio)
+workflow.add_node("analyze_visually", analyze_video_visually)  # Vision LLM analysis
 workflow.add_node("analyze", analyze_transcript)
+workflow.add_node("run_critic", run_critic)  # Critic agent for quality review
 workflow.add_node("generate_heading", generate_heading)
 workflow.add_node("edit_video", edit_video)
 
 workflow.set_entry_point("extract_audio")
 
+# Flow: extract -> transcribe -> visual analysis -> analyze -> critic -> heading -> edit
 workflow.add_edge("extract_audio", "transcribe")
-workflow.add_edge("transcribe", "analyze")
-workflow.add_edge("analyze", "generate_heading")
+workflow.add_edge("transcribe", "analyze_visually")
+workflow.add_edge("analyze_visually", "analyze")
+workflow.add_edge("analyze", "run_critic")
+workflow.add_edge("run_critic", "generate_heading")
 workflow.add_edge("generate_heading", "edit_video")
 workflow.add_edge("edit_video", END)
 
@@ -1070,9 +1733,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PRISM Video Graph - Viral shorts generator")
     parser.add_argument("video_path", help="Path to the input video file")
     parser.add_argument("--dev", action="store_true", help="Development mode: cache transcriptions for faster iteration")
-    parser.add_argument("--preview", action="store_true", help="Preview mode: fast encoding at lower quality (480p)")
-    parser.add_argument("--production", action="store_true", help="Production mode: high quality encoding (720p)")
-    parser.add_argument("--no-critic", action="store_true", help="Disable critic agent for faster processing")
+    parser.add_argument("--preview", action="store_true", help="Preview mode: lower quality, faster export (512x720)")
+    parser.add_argument("--production", action="store_true", help="Production mode: full quality export (1080x1920)")
+    parser.add_argument("--no-critic", action="store_true", help="Disable critic agent review")
     parser.add_argument("--no-music", action="store_true", help="Disable background music")
     
     args = parser.parse_args()
@@ -1080,47 +1743,55 @@ if __name__ == "__main__":
     if not os.path.exists(args.video_path):
         print(f"Error: Video file '{args.video_path}' not found.")
         sys.exit(1)
+    
+    # Determine export mode (default to preview for faster iteration)
+    if args.production:
+        export_mode = "production"
+        print("🎬 [PRODUCTION MODE] Full quality export (1080x1920)")
+    else:
+        export_mode = "preview"
+        print("⚡ [PREVIEW MODE] Fast export (512x720)")
 
-    # Apply command-line overrides using globals
-    if args.preview:
-        globals()['EXPORT_MODE'] = "preview"
-        globals()['TARGET_WIDTH'] = PREVIEW_WIDTH
-        globals()['TARGET_HEIGHT'] = PREVIEW_HEIGHT
-    elif args.production:
-        globals()['EXPORT_MODE'] = "production"
-        globals()['TARGET_WIDTH'] = PRODUCTION_WIDTH
-        globals()['TARGET_HEIGHT'] = PRODUCTION_HEIGHT
+    if args.dev:
+        print("📦 [DEV MODE] Transcription caching enabled")
     
     if args.no_critic:
-        globals()['ENABLE_CRITIC'] = False
+        print("🚫 Critic agent disabled")
     
     if args.no_music:
-        globals()['ENABLE_BACKGROUND_MUSIC'] = False
-
-    # Print startup banner
-    print(f"\n{'='*60}")
-    print(f"🎬 PRISM - AI Video Shorts Generator")
-    print(f"{'='*60}")
-    print(f"   Input: {args.video_path}")
-    print(f"   Export Mode: {EXPORT_MODE.upper()}")
-    print(f"   Resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}")
-    print(f"   Critic: {'Enabled' if ENABLE_CRITIC else 'Disabled'}")
-    print(f"   Music: {'Enabled' if ENABLE_BACKGROUND_MUSIC else 'Disabled'}")
-    if args.dev:
-        print(f"   Dev Mode: Transcript caching enabled")
-    print(f"{'='*60}\n")
+        print("🔇 Background music disabled")
     
-    initial_state = {"input_video_path": args.video_path, "dev_mode": args.dev}
+    print(f"\n🎥 Processing video: {args.video_path}")
+    initial_state: VideoState = cast(VideoState, {
+        "input_video_path": args.video_path, 
+        "dev_mode": args.dev,
+        "export_mode": export_mode,
+        "use_critic": not args.no_critic,
+        "use_music": not args.no_music,
+        "audio_path": "",
+        "transcript_text": "",
+        "transcript_segments": [],
+        "cuts": [],
+        "heading": "",
+        "output_video_path": "",
+        "parameters": {}
+    })
     
     try:
         final_state = app.invoke(initial_state)
-        print(f"Video processing complete! Output saved to: {final_state['output_video_path']}")
-        logger.log_event("run_complete", {"output_video_path": final_state['output_video_path'], "dev_mode": args.dev, "export_mode": EXPORT_MODE})
+        print(f"\n✅ Video processing complete! Output saved to: {final_state['output_video_path']}")
+        logger.log_event("run_complete", {
+            "output_video_path": final_state['output_video_path'], 
+            "dev_mode": args.dev,
+            "export_mode": export_mode,
+            "use_critic": not args.no_critic,
+            "use_music": not args.no_music
+        })
     except Exception as e:
-        print(f"An error occurred during execution: {e}")
+        print(f"\n❌ An error occurred during execution: {e}")
         logger.log_event("run_failed", {"error": str(e)})
     finally:
         # Cleanup temp files
         if os.path.exists("temp_audio.mp3"):
             os.remove("temp_audio.mp3")
-            print("Cleaned up temp_audio.mp3")
+            print("🧹 Cleaned up temp_audio.mp3")
