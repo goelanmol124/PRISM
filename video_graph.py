@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
-from moviepy import VideoFileClip, concatenate_videoclips, ColorClip
+from moviepy import VideoFileClip, concatenate_videoclips
 import whisper
 import torch
 
@@ -256,7 +256,7 @@ def generate_heading(state: VideoState) -> Dict[str, Any]:
 
 
 def edit_video(state: VideoState) -> Dict[str, Any]:
-    """Cuts and stitches the video with 9:16 vertical format, subtitles, transitions, and context heading."""
+    """Cuts and stitches 9:16 video with captions, transitions, letterboxing, and a top-bar heading."""
     print("--- Editing Video ---")
     logger.log_event("node_start", {"node": "edit_video", "input": {"cuts_count": len(state["cuts"]), "heading": state.get("heading")}})
     
@@ -298,6 +298,9 @@ def edit_video(state: VideoState) -> Dict[str, Any]:
                 break
         cuts = trimmed_cuts
         print(f"✅ Trimmed to {len(cuts)} cuts ({accumulated:.1f}s total)")
+
+    # Top/bottom letterbox height (fraction of content height; room for heading in top bar)
+    letterbox_bar = max(1, int(target_height * 0.15))
 
     # MoviePy imports
     from moviepy.video import fx as vfx
@@ -392,7 +395,8 @@ def edit_video(state: VideoState) -> Dict[str, Any]:
                                     start_time=sub_start_rel,
                                     target_width=target_width,
                                     target_height=target_height,
-                                    y_position=0.55  # Slightly below center
+                                    y_position=0.55,  # Slightly below center (content area)
+                                    vertical_offset=letterbox_bar,
                                 )
                                 all_subtitle_clips.append(caption_clip)
                             except Exception as e:
@@ -409,7 +413,10 @@ def edit_video(state: VideoState) -> Dict[str, Any]:
                                     max_width=int(target_width * 0.8),
                                     duration=duration_seg,
                                     start_time=sub_start_rel,
-                                    position=('center', 'center')
+                                    position=(
+                                        'center',
+                                        letterbox_bar + int(target_height * 0.55),
+                                    ),
                                 )
                                 all_subtitle_clips.append(txt_clip)
                 
@@ -456,43 +463,47 @@ def edit_video(state: VideoState) -> Dict[str, Any]:
                 except Exception as e:
                     print(f"[Music] Error adding background music: {e}")
             
+            # Letterboxing (solid top/bottom bars, MoviePy 2.x) — heading sits in top bar
+            base_video = base_video.with_effects(
+                [vfx.Margin(top=letterbox_bar, bottom=letterbox_bar, color=(0, 0, 0))]
+            )
+            composite_height = int(base_video.h)
+
             # --- OPTIMIZATION 4: Single flat CompositeVideoClip for all overlays ---
-            overlay_clips = []
-            
-            # Add heading overlay
+            overlay_clips: List[Any] = []
+
             heading = state.get("heading")
-            bar_height = int(target_height * 0.08)
             if heading:
                 try:
-                    gradient_bar = ColorClip(size=(target_width, bar_height), color=(0, 0, 0))
-                    gradient_bar = gradient_bar.with_opacity(0.65).with_duration(base_video.duration)
-                    gradient_bar = gradient_bar.with_position((0, 0))
-                    overlay_clips.append(gradient_bar)
-                    
-                    # Use Pillow-based heading (FAST)
                     heading_clip = create_text_image_clip(
                         text=heading,
                         font_path=font_path,
                         font_size=heading_font_size,
-                        text_color=(255, 255, 255),  # White
-                        stroke_color=(0, 0, 0),      # Black
+                        text_color=(255, 255, 255),
+                        stroke_color=(0, 0, 0),
                         stroke_width=heading_stroke,
                         max_width=int(target_width * 0.9),
                         duration=base_video.duration,
                         start_time=0,
-                        position=('center', bar_height // 4)  # Vertically center in bar
+                        position=('center', letterbox_bar // 4),
                     )
                     overlay_clips.append(heading_clip)
                     print(f"Added heading overlay: {heading}")
                 except Exception as e:
                     print(f"Could not add heading overlay: {e}")
-                    logger.log_event("warning", {"node": "edit_video", "warning": f"Heading overlay failed: {e}", "heading": heading})
+                    logger.log_event(
+                        "warning",
+                        {
+                            "node": "edit_video",
+                            "warning": f"Heading overlay failed: {e}",
+                            "heading": heading,
+                        },
+                    )
 
-            # Combine base video + all overlays in ONE CompositeVideoClip
             if overlay_clips or all_subtitle_clips:
                 final_clip = CompositeVideoClip(
                     [base_video] + overlay_clips + all_subtitle_clips,
-                    size=(target_width, target_height)
+                    size=(target_width, composite_height),
                 )
             else:
                 final_clip = base_video

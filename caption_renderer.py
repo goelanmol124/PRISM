@@ -288,7 +288,8 @@ def create_animated_caption_clip(
     start_time: float,
     target_width: int = DEFAULT_WIDTH,
     target_height: int = DEFAULT_HEIGHT,
-    y_position: float = 0.55  # Vertical position (0-1, from top)
+    y_position: float = 0.55,  # Vertical position (0-1, from top of content area)
+    vertical_offset: int = 0,  # Pixels to shift down (e.g. top letterbox bar height)
 ) -> ImageClip:
     """
     Create a caption clip for multi-word groups.
@@ -310,8 +311,8 @@ def create_animated_caption_clip(
     clip = clip.with_duration(duration)
     clip = clip.with_start(start_time)
     
-    # Position the caption
-    y_pos = int(target_height * y_position)
+    # Position the caption (within content area, below any top letterbox)
+    y_pos = vertical_offset + int(target_height * y_position)
     clip = clip.with_position(('center', y_pos))
     
     return clip
